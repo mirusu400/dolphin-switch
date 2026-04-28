@@ -1,26 +1,36 @@
-# Custom Switch frontend.
-# M0: hello-world NRO that prints over nxlink.
-# Later milestones replace src/main.cpp with the ImGui-based frontend.
+# Custom Switch frontend (M5-prep skeleton).
+# ImGui + switch-sdl2 + libnx EGL/GLES2 stack. Hello-world fallback path
+# kept under nxlink for early-boot debug output.
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
+
+set(IMGUI_BACKENDS "${CMAKE_SOURCE_DIR}/dolphin/Externals/imgui/imgui/backends")
 
 add_executable(dolphin-switch-frontend
     src/main.cpp
     src/switch_libc_shim.c
+    src/debug_log.cpp
+    "${IMGUI_BACKENDS}/imgui_impl_sdl2.cpp"
+    "${IMGUI_BACKENDS}/imgui_impl_opengl3.cpp"
 )
 
 target_compile_definitions(dolphin-switch-frontend PRIVATE
     __SWITCH__=1
+    IMGUI_IMPL_OPENGL_ES2=1
 )
 
 target_include_directories(dolphin-switch-frontend PRIVATE
     "${CMAKE_SOURCE_DIR}/dolphin/Source/Core"
+    "${CMAKE_SOURCE_DIR}/dolphin/Externals/imgui"
+    "${CMAKE_SOURCE_DIR}/dolphin/Externals/imgui/imgui"
+    "${IMGUI_BACKENDS}"
 )
 
 # libnx is wired in by Switch.cmake's platform module via the toolchain.
-# We still link it explicitly so a non-default link order does not bite us later.
-#
-# M1 link-validation: pull in the headless half of the Dolphin core so the
-# frontend NRO actually contains dolphin code. The ImGui/UI piece lands in
-# M5 — for now this just proves the libs link end-to-end into an NRO.
+# Dolphin libs go first so the linker picks symbols in the right order;
+# SDL2 / GLES come from devkitPro portlibs.
 target_link_libraries(dolphin-switch-frontend PRIVATE
     uicommon
     core
@@ -30,6 +40,9 @@ target_link_libraries(dolphin-switch-frontend PRIVATE
     videonull
     videosoftware
     common
+    imgui
+    PkgConfig::SDL2
+    PkgConfig::GLESV2
     nx
 )
 
