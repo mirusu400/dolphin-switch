@@ -1,0 +1,6 @@
+[submodule "dolphin"]
+	path = dolphin
+	url = https://github.com/mirusu400/dolphin.git
+[submodule "reference/xerpi-dolphin-switch"]
+	path = reference/xerpi-dolphin-switch
+	url = https://github.com/xerpi/dolphin-switch.git

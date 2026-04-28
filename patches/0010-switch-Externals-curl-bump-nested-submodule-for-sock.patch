@@ -1,0 +1,20 @@
+From 9be89203a1ac6c5362bde307000972d05577eec3 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Tue, 28 Apr 2026 15:30:47 +0900
+Subject: [PATCH 10/25] [switch] Externals/curl: bump nested submodule for
+ socketpair Switch arm
+
+---
+ Externals/curl/curl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Externals/curl/curl b/Externals/curl/curl
+index cfbfb65047..b3fb6dc83a 160000
+--- a/Externals/curl/curl
++++ b/Externals/curl/curl
+@@ -1 +1 @@
+-Subproject commit cfbfb65047e85e6b08af65fe9cdbcf68e9ad496a
++Subproject commit b3fb6dc83add68ad7e403aab458db0cb3bffd52e
+-- 
+2.43.0
+

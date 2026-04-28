@@ -1,0 +1,29 @@
+From 7904b54c664fd1570a7f01dca2e43bc62ade32cc Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Tue, 28 Apr 2026 15:25:20 +0900
+Subject: [PATCH 08/25] [switch] Externals/SFML: bump nested submodule for
+ Switch OS arm
+
+The vendored SFML at Externals/SFML/SFML is itself a git submodule.
+This commit advances its pointer to a switch-build-prep branch that
+patches include/SFML/Config.hpp:106 with a __SWITCH__ alias to
+SFML_SYSTEM_LINUX. Without it, the OS-detection cascade #errors out
+on devkitA64 because the toolchain defines neither _WIN32, __APPLE__,
+nor __unix__.
+
+Dolphin only uses SFML's Network module; libnx exposes BSD sockets
++ select() with the same shape as Linux glibc.
+---
+ Externals/SFML/SFML | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Externals/SFML/SFML b/Externals/SFML/SFML
+index 0fa201c969..f9b84ab137 160000
+--- a/Externals/SFML/SFML
++++ b/Externals/SFML/SFML
+@@ -1 +1 @@
+-Subproject commit 0fa201c969e48ecc253581c5841ce73f44d42f49
++Subproject commit f9b84ab137ddfd08ab501f695682ddf2425f1d1e
+-- 
+2.43.0
+
