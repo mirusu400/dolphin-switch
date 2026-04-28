@@ -1,0 +1,60 @@
+# docker compose runner for the dolphin-switch build.
+#
+#   docker compose run --rm build              # release build
+#   docker compose run --rm build-debug        # -O0 + symbols
+#   docker compose run --rm build-clean        # nuke build/ first
+#   docker compose run --rm host-build         # host-side dolphin sanity
+#   docker compose run --rm shell              # interactive shell
+#
+# All services share the same image and bind-mount the repo at /workspace.
+# User-id mapping ensures the build/ directory ends up owned by you, not
+# root. Set UID/GID env vars before running, or rely on the 1000:1000
+# default which matches most desktop installs.
+
+services:
+  build:
+    build: .
+    image: dolphin-switch:dev
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: bash scripts/build.sh
+
+  build-debug:
+    build: .
+    image: dolphin-switch:dev
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: bash scripts/build.sh --debug
+
+  build-clean:
+    build: .
+    image: dolphin-switch:dev
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: bash scripts/build.sh --clean
+
+  host-build:
+    build: .
+    image: dolphin-switch:dev
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: bash scripts/build-host.sh
+
+  shell:
+    build: .
+    image: dolphin-switch:dev
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: bash

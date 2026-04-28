@@ -1,0 +1,30 @@
+# Keep the docker build context small. The actual build runs in a
+# bind-mounted volume; the COPY-in during image construction is empty
+# today (the Dockerfile only installs packages), but compose / build
+# still tar-stream the context so we filter aggressively.
+
+build/
+.git/
+.cache/
+.claude/
+
+# Reference port — read-only, several hundred MB, never needed for build.
+reference/
+
+# Already-built artifacts.
+*.nro
+*.nso
+*.elf
+*.nacp
+*.o
+*.a
+
+# Editor / OS clutter.
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Logs collected during host iteration.
+/tmp/build-*.log
