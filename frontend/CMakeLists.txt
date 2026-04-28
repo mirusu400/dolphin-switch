@@ -18,6 +18,7 @@ add_executable(dolphin-switch-frontend
 
 target_compile_definitions(dolphin-switch-frontend PRIVATE
     __SWITCH__=1
+    _M_ARM_64=1
     IMGUI_IMPL_OPENGL_ES3=1
 )
 

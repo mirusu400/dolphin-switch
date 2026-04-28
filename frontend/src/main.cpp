@@ -42,6 +42,7 @@
 #include "Core/Boot/Boot.h"
 #include "Core/Core.h"
 #include "Core/Host.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 #include "debug_log.h"
@@ -341,11 +342,34 @@ int main(int /*argc*/, char** /*argv*/)
   Config::SetBase(Config::MAIN_FASTMEM_ARENA, false);
   DBG_INFO("Forced fastmem = OFF.");
 
+  // Force Interpreter CPU core. JITARM64 default would emit ARM64 code into
+  // the rw_addr alias and branch the dispatcher to the SAME pointer, but on
+  // Horizon OS rw and rx are distinct VA aliases — branching to rw is a
+  // kernel panic (fatal 2345-0008). The rw→rx dispatcher translation is M2
+  // load-bearing work per docs/jit-memory.md §swap-strategy step 3 and is
+  // not implemented yet. Interpreter sidesteps the JIT entirely.
+  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::Interpreter);
+  DBG_INFO("Forced CPU core = Interpreter (JIT rw→rx alias not done; M2).");
+
+  // DSP HLE on (default true, but make it explicit). DSP_LLE drags in the
+  // x86-only DSP JIT — falls back to DSPEmitterNull on ARM64 but at HLE
+  // throughput we don't care.
+  Config::SetBase(Config::MAIN_DSP_HLE, true);
+  Config::SetBase(Config::MAIN_DSP_THREAD, false);
+  DBG_INFO("Forced DSP HLE = ON, DSP_THREAD = OFF.");
+
+  // Mute audio + force NullSound — audren backend is M4 work; until then
+  // produce no sound rather than risk Cubeb fallback paths on Switch.
+  Config::SetBase(Config::MAIN_AUDIO_BACKEND, std::string{BACKEND_NULLSOUND});
+  Config::SetBase(Config::MAIN_AUDIO_MUTED, true);
+  DBG_INFO("Forced audio backend = NullSound, muted.");
+
   const std::string rom_path = "sdmc:/roms/GameCube-240pSuite-1.20.iso";
   bool core_booted = false;
 
   // Hook Core state transitions so we can see the boot progress.
-  Core::AddOnStateChangedCallback([](Core::State state) {
+  // EventHook is [[nodiscard]] — keep alive for the whole frontend lifetime.
+  static auto state_hook = Core::AddOnStateChangedCallback([](Core::State state) {
     const char* name = "?";
     switch (state)
     {
