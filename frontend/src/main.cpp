@@ -26,7 +26,7 @@
 
 #include <SDL2/SDL.h>
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
@@ -34,7 +34,15 @@
 
 #include "UICommon/UICommon.h"
 #include "Common/Version.h"
+#include "Common/FileUtil.h"
+#include "Common/Config/Config.h"
+#include "Common/WindowSystemInfo.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/BootManager.h"
+#include "Core/Boot/Boot.h"
+#include "Core/Core.h"
 #include "Core/Host.h"
+#include "Core/System.h"
 
 #include "debug_log.h"
 
@@ -234,6 +242,33 @@ int main(int /*argc*/, char** /*argv*/)
 
   DBG_INFO("dolphin-switch boot — version %s", Common::GetScmRevStr().c_str());
   DBG_INFO("nxlink fd: %d (negative = no host listening)", nxlink_fd);
+
+  // Dolphin's user-data root must be set BEFORE UICommon::Init runs —
+  // otherwise the IOS HLE filesystem asserts on an empty m_root_path
+  // (Core/IOS/FS/HostBackend/FS.cpp:46 BuildFilename). On Switch the
+  // canonical layout per CLAUDE.md is:
+  //   sdmc:/switch/dolphin/      — writable state (config, NAND, saves)
+  //   sdmc:/switch/dolphin/Sys/  — system files (per-game compat DB)
+  //   sdmc:/roms/                — ROM scan dir
+  // The Sys folder will eventually ship inside the NRO romfs; for now,
+  // SetSysDirectory points at the user dir so missing files just yield
+  // "not found" rather than an assert.
+  constexpr const char* kUserDir = "sdmc:/switch/dolphin/";
+  File::CreateFullPath(kUserDir);
+  File::SetUserPath(D_USER_IDX, kUserDir);
+  File::SetUserPath(D_CONFIG_IDX, std::string(kUserDir) + "Config/");
+  File::SetUserPath(D_CACHE_IDX, std::string(kUserDir) + "Cache/");
+  File::SetUserPath(D_GCUSER_IDX, std::string(kUserDir) + "User/GC/");
+  File::SetUserPath(D_WIIROOT_IDX, std::string(kUserDir) + "Wii/");
+  File::SetUserPath(D_SESSION_WIIROOT_IDX, std::string(kUserDir) + "Wii/");
+  File::SetUserPath(D_DUMP_IDX, std::string(kUserDir) + "Dump/");
+  File::SetUserPath(D_LOAD_IDX, std::string(kUserDir) + "Load/");
+  File::SetUserPath(D_LOGS_IDX, std::string(kUserDir) + "Logs/");
+  File::SetUserPath(D_STATESAVES_IDX, std::string(kUserDir) + "StateSaves/");
+  File::SetUserPath(D_SCREENSHOTS_IDX, std::string(kUserDir) + "ScreenShots/");
+  File::SetUserPath(D_THEMES_IDX, std::string(kUserDir) + "Themes/");
+  DBG_INFO("User paths set under %s", kUserDir);
+
   DBG_INFO("Calling UICommon::Init()...");
   UICommon::Init();
   DBG_INFO("UICommon::Init() returned.");
@@ -264,8 +299,88 @@ int main(int /*argc*/, char** /*argv*/)
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
   ImGui::StyleColorsDark();
   ImGui_ImplSDL2_InitForOpenGL(window, gl_ctx);
-  ImGui_ImplOpenGL3_Init("#version 320 es");
+  // ImGui's GLES shader template only triggers on glsl_version == 300, even
+  // though Mesa here advertises GLSL ES 3.20. Pass 300 es so ImGui picks the
+  // *_glsl_300_es shader (which prepends `precision mediump float;`).
+  ImGui_ImplOpenGL3_Init("#version 300 es");
   DBG_INFO("ImGui SDL2+GLES backends initialized.");
+
+  // ---------------------------------------------------------------------
+  // Direct ROM auto-boot (M2-stage hardware bring-up).
+  //
+  // We're skipping the ImGui ROM-browser flow at the user's request and
+  // calling BootManager::BootCore directly. This is expected to surface
+  // the next blockers — most likely the MemArena Switch stub (M2.5)
+  // returning nullptr from CreateView/MapInMemoryRegion before the JIT
+  // dispatcher even runs.
+  //
+  // WindowSystemInfo type=Headless picks Dolphin's Null video backend,
+  // which is what we want until M3 wires GLContextSwitch into the OGL
+  // backend. Audio/input come up via the existing Switch arms (audren
+  // is M4, hid mapping is M4 — both are no-op on Switch right now).
+  // ---------------------------------------------------------------------
+  WindowSystemInfo wsi{};
+  wsi.type = WindowSystemType::Headless;
+  wsi.render_window = nullptr;
+  wsi.render_surface = nullptr;
+
+  UICommon::InitControllers(wsi);
+  DBG_INFO("UICommon::InitControllers returned.");
+
+  // Force the Null video backend — there is no working OGL backend wired to
+  // our SDL2/EGL surface yet (M3). Null lets the CPU/JIT path run without a
+  // window backend; we render our own ImGui-only output.
+  Config::SetBase(Config::MAIN_GFX_BACKEND, std::string{"Null"});
+  DBG_INFO("Forced video backend = Null.");
+
+  // Disable fastmem on Switch — Dolphin's InitFastmemArena reserves a 14
+  // GiB VA window which the Switch process budget (3.2 GiB) cannot cover.
+  // The slower memory-check path still emulates correctly, just without
+  // the JIT pointer-math fast path. M2 hardware perf work revisits this.
+  Config::SetBase(Config::MAIN_FASTMEM, false);
+  Config::SetBase(Config::MAIN_FASTMEM_ARENA, false);
+  DBG_INFO("Forced fastmem = OFF.");
+
+  const std::string rom_path = "sdmc:/roms/GameCube-240pSuite-1.20.iso";
+  bool core_booted = false;
+
+  // Hook Core state transitions so we can see the boot progress.
+  Core::AddOnStateChangedCallback([](Core::State state) {
+    const char* name = "?";
+    switch (state)
+    {
+    case Core::State::Uninitialized: name = "Uninitialized"; break;
+    case Core::State::Paused:        name = "Paused";        break;
+    case Core::State::Running:       name = "Running";       break;
+    case Core::State::Starting:      name = "Starting";      break;
+    case Core::State::Stopping:      name = "Stopping";      break;
+    }
+    DBG_INFO("Core state -> %s", name);
+  });
+
+  auto try_boot_rom = [&]() {
+    if (core_booted)
+      return;
+    if (!std::filesystem::exists(rom_path))
+    {
+      DBG_WARN("ROM not found at %s; skipping boot.", rom_path.c_str());
+      return;
+    }
+    DBG_INFO("BootParameters::GenerateFromFile(%s)", rom_path.c_str());
+    auto boot_params = BootParameters::GenerateFromFile(rom_path);
+    if (!boot_params)
+    {
+      DBG_ERROR("GenerateFromFile returned null — bad ROM or unsupported format.");
+      return;
+    }
+    DBG_INFO("BootManager::BootCore starting...");
+    core_booted = BootManager::BootCore(Core::System::GetInstance(),
+                                        std::move(boot_params), wsi);
+    if (core_booted)
+      DBG_INFO("BootCore returned true (Core thread launched).");
+    else
+      DBG_ERROR("BootCore returned false — boot rejected.");
+  };
 
   bool running = true;
   while (running && appletMainLoop())
@@ -276,11 +391,21 @@ int main(int /*argc*/, char** /*argv*/)
       ImGui_ImplSDL2_ProcessEvent(&event);
       if (event.type == SDL_QUIT)
         running = false;
-      // Switch's "+" button maps to SDL_CONTROLLER_BUTTON_START.
-      if (event.type == SDL_CONTROLLERBUTTONDOWN &&
-          event.cbutton.button == SDL_CONTROLLER_BUTTON_START)
+      if (event.type == SDL_CONTROLLERBUTTONDOWN)
       {
-        running = false;
+        // Switch button mapping (SDL2):
+        //   A → SDL_CONTROLLER_BUTTON_A           (boot ROM)
+        //   + → SDL_CONTROLLER_BUTTON_START       (exit)
+        if (event.cbutton.button == SDL_CONTROLLER_BUTTON_START)
+        {
+          DBG_INFO("Plus pressed — exiting main loop.");
+          running = false;
+        }
+        else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_A)
+        {
+          DBG_INFO("A pressed — triggering ROM boot.");
+          try_boot_rom();
+        }
       }
     }
 
@@ -301,6 +426,12 @@ int main(int /*argc*/, char** /*argv*/)
     ImGui::Text("dolphin version: %s", Common::GetScmRevStr().c_str());
     ImGui::Text("Renderer: SDL2 + Mesa GLES (libnx EGL)");
     ImGui::Text("ROM dir:  %s   (%zu entries)", kRomDir, roms.size());
+    if (core_booted)
+      ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Core: BOOTED");
+    else
+      ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
+                         "Core: not booted — press A to boot %s, + to exit.",
+                         std::filesystem::path(rom_path).filename().string().c_str());
     ImGui::Separator();
 
     if (ImGui::Button("Rescan"))
@@ -390,6 +521,14 @@ int main(int /*argc*/, char** /*argv*/)
   }
 
   DBG_INFO("Main loop exited; shutting down.");
+  if (core_booted)
+  {
+    DBG_INFO("Core::Stop()...");
+    Core::Stop(Core::System::GetInstance());
+    DBG_INFO("Core::Shutdown()...");
+    Core::Shutdown(Core::System::GetInstance());
+  }
+  UICommon::ShutdownControllers();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();

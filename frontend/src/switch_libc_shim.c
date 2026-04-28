@@ -69,3 +69,46 @@ int waitpid(int pid, int* wstatus, int options)
     (void)options;
     return -1;
 }
+
+// Common/DirectIOFile uses pread/pwrite for atomic offset I/O. Newlib
+// declares them via _GNU_SOURCE but ships no implementation. Emulate
+// via lseek+read/write — not atomic across threads, but DirectIOFile
+// is single-threaded per file handle.
+#include <sys/types.h>
+#include <unistd.h>
+
+ssize_t pread(int fd, void* buf, size_t count, off_t offset)
+{
+    off_t saved = lseek(fd, 0, SEEK_CUR);
+    if (saved < 0)
+        return -1;
+    if (lseek(fd, offset, SEEK_SET) < 0)
+        return -1;
+    ssize_t n = read(fd, buf, count);
+    lseek(fd, saved, SEEK_SET);
+    return n;
+}
+
+ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset)
+{
+    off_t saved = lseek(fd, 0, SEEK_CUR);
+    if (saved < 0)
+        return -1;
+    if (lseek(fd, offset, SEEK_SET) < 0)
+        return -1;
+    ssize_t n = write(fd, buf, count);
+    lseek(fd, saved, SEEK_SET);
+    return n;
+}
+
+// sysconf — newlib declares the prototype but does not ship libc impl.
+// JitBase.cpp uses _SC_PAGESIZE for stack-guard math; Switch's MMU page
+// granule is 4 KiB. Other queries return -1 to signal "not supported".
+// Constant value (8) sourced from sys/unistd.h on devkitA64.
+long sysconf(int name)
+{
+    enum { SHIM_SC_PAGESIZE = 8 };
+    if (name == SHIM_SC_PAGESIZE)
+        return 0x1000;
+    return -1;
+}

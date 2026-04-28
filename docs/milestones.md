@@ -343,6 +343,141 @@ got gated wholesale on Switch:
 
 ---
 
+## 2026-04-28 - First hardware test session: M0/M1/M5-prep on real Switch
+
+Hardware test on real CFW Switch via nxlink netloader. Frontend NRO
+booted, ran for 5+ minutes, exited cleanly. Then M2-stage auto-boot
+work began: real `MemArenaSwitch.cpp`, mbedtls entropy via libnx,
+IOS_FS / video / fastmem config wiring, `BootManager::BootCore`
+integration. End of session: Core thread crashes shortly after
+`BootCore` launches it. Frontend itself is rock-solid; remaining
+work is M2 emulator core bring-up.
+
+**Validated on real hardware**
+
+- `JIT capability probe: PASS` (`jitCreate(1MiB)` ok). Confirms
+  hbmenu inheritance grants the JIT capability — the entire premise
+  of this port.
+- `GL_VENDOR: nouveau / GL_RENDERER: NV120` (Tegra X1).
+- `GL_VERSION: OpenGL ES 3.2 Mesa 20.1.0-rc3` — matches M3 plan.
+- `svcGetInfo TotalMemorySize: 3343908864 bytes (3189 MiB)` —
+  matches CLAUDE.md "~3.2 GB usable" assumption.
+- `svcGetInfo UsedMemorySize: 3185 MiB` — almost the whole heap is
+  pre-grabbed by hbloader. JIT and emulated-mem regions come from
+  separate VA pools so this is fine.
+- ImGui + SDL2 + Mesa GLES rendered the demo + ROM browser + log
+  panel for a 5-minute session before clean exit. Gamepad nav
+  confirmed (`+` → SDL_CONTROLLER_BUTTON_START → exit; `A` →
+  SDL_CONTROLLER_BUTTON_A → trigger boot).
+- ROM browser scanned `sdmc:/roms/` and listed `.iso` candidates.
+- `BootParameters::GenerateFromFile()` parses the 240p Test Suite
+  ISO without complaint.
+- `BootManager::BootCore()` returns `true` (Core thread launched).
+
+**M2 hardware bring-up — what landed this session**
+
+- **`Common/MemArenaSwitch.cpp`** — replaced the M2.5 stub with the
+  full libnx implementation. `aligned_alloc` for backing,
+  `virtmemFindCodeMemory` + `svcMapProcessCodeMemory` to expose
+  the SHM as code memory, `svcMapProcessMemory` to clone views into
+  ASLR'd ranges. Process handle via `svcGetInfo(InfoType 65001)`.
+  Single-instance state in file-scope statics. All three xerpi bugs
+  from `docs/emulated-memory.md §xerpi-bugs` are fixed. Verified:
+  Memory::Init no longer aborts.
+- **`Externals/mbedtls/library/entropy_poll.c`** — `__SWITCH__` arm
+  provides `mbedtls_platform_entropy_poll` backed by libnx
+  `randomGet` (csrng). `MBEDTLS_NO_PLATFORM_ENTROPY` removed from
+  parent CMakeLists. `Common::Random::EntropySeededPRNG` ctor no
+  longer asserts.
+- **`Source/Core/Core/HW/EXI/BBA/TAP_Switch.cpp`** + Core/CMakeLists
+  arm — Switch was missing `TAPNetworkInterface` vtable. Stub.
+- **`frontend/src/main.cpp`** —
+  - `File::SetUserPath(D_*_IDX, "sdmc:/switch/dolphin/...")` for
+    every Dolphin user-path index. Without this, `IOS::HLE::FS`
+    asserts at FS.cpp:46.
+  - `Config::SetBase(MAIN_GFX_BACKEND, "Null")` forces null video.
+  - `Config::SetBase(MAIN_FASTMEM, false)` — fastmem reserves a
+    14 GiB VA window the Switch process budget cannot cover.
+  - `BootManager::BootCore` triggered by user pressing `A` on
+    controller (deferred so ImGui log renders before any Core
+    crash).
+  - `Core::AddOnStateChangedCallback` reports state transitions.
+- **`frontend/src/switch_libc_shim.c`** — `pread` / `pwrite` (via
+  lseek+rw), `sysconf(_SC_PAGESIZE)` returning 0x1000.
+- **`frontend/CMakeLists.txt`** — bumped `CXX_STANDARD` to 23
+  (Common/StringUtil.h uses `std::to_underlying`).
+- **`frontend/src/debug_log.{h,cpp}`** — three-sink log facility:
+  nxlink stdio + SD file
+  (`sdmc:/switch/dolphin/logs/dolphin-switch-YYYYMMDD-HHMMSS.log`)
+  + ImGui ring buffer with color-coded levels.
+  `dbg::DumpSystemInfo()` emits a one-shot probe of libnx env,
+  memory budget, JIT cap, GL strings.
+
+**End-of-session blocker**
+
+After `BootCore` returns true (EmuThread spawn succeeds), the Core
+thread aborts within ~50 ms. nxlink stdio shows no error before the
+disconnect — the kernel kills the process faster than the log file
+flushes. Switch fatal screen shows code **2345-0008**.
+
+`Core::AddOnStateChangedCallback` hook never fired, suggesting the
+Core thread did not reach `Core::State::Starting`. Most likely (in
+decreasing probability):
+1. **Audio backend init** — every audio option in our CMake build
+   is OFF (cubeb, ALSA, PulseAudio). AudioCommon may panic on no
+   selectable backend rather than falling back to `NoSound`.
+2. **JIT 256 MiB allocation** — `JitArm64::Init` calls
+   `Common::AllocateExecutableMemory(0x10000000)`. Our MemoryUtil
+   `__SWITCH__` arm calls `jitCreate(256MiB)`.
+3. **Boot files missing** — Dolphin's boot path looks for `Sys/`
+   resources (per-game compatibility DB, IPL bootrom). We have not
+   shipped these inside the NRO romfs yet.
+4. **DSP HLE bring-up** — `MAIN_DSP_HLE` defaults vary; `DSPLLE`
+   needs `dsp_rom.bin` which is not present.
+
+**Files modified this session**
+
+Submodule `dolphin/` (4 new commits, total 28 on switch-build-prep):
+- `Externals/mbedtls/library/entropy_poll.c` — Switch entropy arm.
+- `Source/Core/Common/MemArenaSwitch.cpp` — full virtmem impl.
+- `Source/Core/Core/CMakeLists.txt` — `elseif(NINTENDO_SWITCH)` TAP.
+- `Source/Core/Core/HW/EXI/BBA/TAP_Switch.cpp` — new stub.
+
+Parent `dolphin-switch/`:
+- `CMakeLists.txt` — drop `MBEDTLS_NO_PLATFORM_ENTROPY`.
+- `frontend/CMakeLists.txt` — link dolphin libs, ImGui backends,
+  SDL2/glesv2, `IMGUI_IMPL_OPENGL_ES3`, `CXX_STANDARD 23`.
+- `frontend/src/main.cpp` — host stubs, ROM scan, deferred boot,
+  Core state callback, ImGui log panel.
+- `frontend/src/switch_libc_shim.c` — `pread`/`pwrite`/`sysconf`.
+- `frontend/src/debug_log.{h,cpp}` — new three-sink log facility.
+- `Dockerfile` + `docker-compose.yml` + `.dockerignore` +
+  `scripts/docker-build.sh` — reproducible build env.
+- `README.md` — description + build + run guide.
+
+**What to do next session (no Switch hardware needed for #1, #2)**
+
+1. **Force `MAIN_DSP_HLE` true + audio backend "NullSound"** before
+   BootCore. Best chance of bypassing the Core-thread crash without
+   further code changes.
+2. **Build a `Sys/` romfs** and ship it inside the NRO. Even
+   minimal `Sys/` (just default GameINI files) helps — Dolphin
+   tolerates missing files but tries to read them from the user
+   dir.
+3. **Hardware: incrementally re-attempt `BootCore`** after each
+   single config change. Each iteration may cost a kernel-panic
+   reboot.
+4. **JitArm64 dispatcher rw → rx alias plumbing** is the real
+   load-bearing M2 work — required for emulated CPU code to
+   actually execute. Plan in `docs/jit-memory.md` §swap-strategy.
+
+**Build status:** parent NRO is **15 MiB** end-of-session
+(`build/switch-release/frontend/dolphin-switch-frontend.nro`),
+contains all dolphin libs, runs cleanly through the deferred-boot
+prompt. Last cross-compile build: build #55, exit 0.
+
+---
+
 ## 2026-04-28 - M1 fully validated end-to-end (5.2 MB NRO)
 
 **Frontend now links dolphin libs into the NRO**

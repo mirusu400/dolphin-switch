@@ -83,13 +83,10 @@ set(USE_NGHTTP2         OFF CACHE BOOL "" FORCE)
 set(USE_LIBIDN2         OFF CACHE BOOL "" FORCE)
 set(BUILD_CURL_EXE      OFF CACHE BOOL "" FORCE)
 
-# Externals/mbedtls: entropy_poll.c #errors out under Switch because
-# devkitA64 is neither Unix nor Windows from mbedtls's POV. Disable
-# platform entropy via the documented switch — Dolphin's own callers
-# pass mbedtls a deterministic seed for the paths it actually
-# exercises (WiiSave + http signing). M5+ wires libnx randomGet for a
-# proper entropy source.
-add_compile_definitions(MBEDTLS_NO_PLATFORM_ENTROPY)
+# Externals/mbedtls: a __SWITCH__ arm in entropy_poll.c provides
+# mbedtls_platform_entropy_poll() backed by libnx randomGet (csrng
+# service). MBEDTLS_NO_PLATFORM_ENTROPY is therefore NOT set — we have
+# a real entropy source.
 
 # devkitA64's newlib gates pthread_setname_np, pthread_getattr_np,
 # and vasprintf behind __GNU_VISIBLE (sys/features.h). _GNU_SOURCE

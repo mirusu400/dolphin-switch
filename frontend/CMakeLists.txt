@@ -18,7 +18,16 @@ add_executable(dolphin-switch-frontend
 
 target_compile_definitions(dolphin-switch-frontend PRIVATE
     __SWITCH__=1
-    IMGUI_IMPL_OPENGL_ES2=1
+    IMGUI_IMPL_OPENGL_ES3=1
+)
+
+# Dolphin headers (e.g. Common/StringUtil.h) use std::to_underlying which is
+# C++23 only. Frontend defaults to C++20 from the top-level project; bump it
+# locally for this target.
+set_target_properties(dolphin-switch-frontend PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
 )
 
 target_include_directories(dolphin-switch-frontend PRIVATE
