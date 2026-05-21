@@ -13,6 +13,7 @@
 //   - Newlib symbol-gap stubs live in switch_libc_shim.c.
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -175,6 +176,22 @@ std::string FormatSize(std::uintmax_t bytes)
   return buf;
 }
 
+std::string ResolveBootPath(const std::vector<RomEntry>& roms, int selected,
+                            const std::string& fallback)
+{
+  if (selected >= 0 && selected < static_cast<int>(roms.size()))
+    return roms[selected].path;
+
+  std::error_code ec;
+  if (!fallback.empty() && std::filesystem::exists(fallback, ec))
+    return fallback;
+
+  if (!roms.empty())
+    return roms.front().path;
+
+  return {};
+}
+
 // Returns true if SDL is up and the GL context is current.
 bool InitGraphics(SDL_Window** out_window, SDL_GLContext* out_ctx)
 {
@@ -244,31 +261,59 @@ int main(int /*argc*/, char** /*argv*/)
   DBG_INFO("dolphin-switch boot — version %s", Common::GetScmRevStr().c_str());
   DBG_INFO("nxlink fd: %d (negative = no host listening)", nxlink_fd);
 
+  bool romfs_mounted = false;
+  Result romfs_rc = romfsInit();
+  if (R_SUCCEEDED(romfs_rc))
+  {
+    romfs_mounted = true;
+    DBG_INFO("romfsInit: PASS; Dolphin Sys directory will use romfs:/Sys/");
+  }
+  else
+  {
+    DBG_WARN("romfsInit failed: rc=0x%08X; falling back to sdmc Sys directory.", romfs_rc);
+  }
+
   // Dolphin's user-data root must be set BEFORE UICommon::Init runs —
   // otherwise the IOS HLE filesystem asserts on an empty m_root_path
   // (Core/IOS/FS/HostBackend/FS.cpp:46 BuildFilename). On Switch the
   // canonical layout per CLAUDE.md is:
   //   sdmc:/switch/dolphin/      — writable state (config, NAND, saves)
-  //   sdmc:/switch/dolphin/Sys/  — system files (per-game compat DB)
+  //   romfs:/Sys/                — read-only system files (per-game compat DB)
   //   sdmc:/roms/                — ROM scan dir
-  // The Sys folder will eventually ship inside the NRO romfs; for now,
-  // SetSysDirectory points at the user dir so missing files just yield
-  // "not found" rather than an assert.
   constexpr const char* kUserDir = "sdmc:/switch/dolphin/";
   File::CreateFullPath(kUserDir);
   File::SetUserPath(D_USER_IDX, kUserDir);
-  File::SetUserPath(D_CONFIG_IDX, std::string(kUserDir) + "Config/");
-  File::SetUserPath(D_CACHE_IDX, std::string(kUserDir) + "Cache/");
-  File::SetUserPath(D_GCUSER_IDX, std::string(kUserDir) + "User/GC/");
-  File::SetUserPath(D_WIIROOT_IDX, std::string(kUserDir) + "Wii/");
-  File::SetUserPath(D_SESSION_WIIROOT_IDX, std::string(kUserDir) + "Wii/");
-  File::SetUserPath(D_DUMP_IDX, std::string(kUserDir) + "Dump/");
-  File::SetUserPath(D_LOAD_IDX, std::string(kUserDir) + "Load/");
-  File::SetUserPath(D_LOGS_IDX, std::string(kUserDir) + "Logs/");
-  File::SetUserPath(D_STATESAVES_IDX, std::string(kUserDir) + "StateSaves/");
-  File::SetUserPath(D_SCREENSHOTS_IDX, std::string(kUserDir) + "ScreenShots/");
-  File::SetUserPath(D_THEMES_IDX, std::string(kUserDir) + "Themes/");
+  File::SetUserPath(D_SESSION_WIIROOT_IDX, File::GetUserPath(D_WIIROOT_IDX));
+
+  const unsigned int required_user_dirs[] = {
+      D_CONFIG_IDX,
+      D_CACHE_IDX,
+      D_GCUSER_IDX,
+      D_WIIROOT_IDX,
+      D_SESSION_WIIROOT_IDX,
+      D_DUMP_IDX,
+      D_LOAD_IDX,
+      D_LOGS_IDX,
+      D_STATESAVES_IDX,
+      D_SCREENSHOTS_IDX,
+      D_THEMES_IDX,
+      D_GAMESETTINGS_IDX,
+  };
+  for (const unsigned int dir : required_user_dirs)
+    File::CreateFullPath(File::GetUserPath(dir));
   DBG_INFO("User paths set under %s", kUserDir);
+
+  if (romfs_mounted)
+  {
+    File::SetSysDirectory("romfs:/Sys");
+  }
+  else
+  {
+    const std::string fallback_sys_dir = std::string(kUserDir) + "Sys";
+    File::CreateFullPath(fallback_sys_dir);
+    File::SetSysDirectory(fallback_sys_dir);
+  }
+  DBG_INFO("Dolphin Sys directory: %s", File::GetSysDirectory().c_str());
 
   DBG_INFO("Calling UICommon::Init()...");
   UICommon::Init();
@@ -283,6 +328,8 @@ int main(int /*argc*/, char** /*argv*/)
   {
     DBG_ERROR("Graphics init failed; aborting boot.");
     UICommon::Shutdown();
+    if (romfs_mounted)
+      romfsExit();
     dbg::Shutdown();
     CloseNxlink(nxlink_fd);
     return 1;
@@ -307,13 +354,11 @@ int main(int /*argc*/, char** /*argv*/)
   DBG_INFO("ImGui SDL2+GLES backends initialized.");
 
   // ---------------------------------------------------------------------
-  // Direct ROM auto-boot (M2-stage hardware bring-up).
+  // Direct ROM boot (M2-stage hardware bring-up).
   //
-  // We're skipping the ImGui ROM-browser flow at the user's request and
-  // calling BootManager::BootCore directly. This is expected to surface
-  // the next blockers — most likely the MemArena Switch stub (M2.5)
-  // returning nullptr from CreateView/MapInMemoryRegion before the JIT
-  // dispatcher even runs.
+  // The ImGui browser can now pass a selected ROM into BootManager::BootCore.
+  // This is expected to surface the next blockers in the emulator core rather
+  // than frontend wiring.
   //
   // WindowSystemInfo type=Headless picks Dolphin's Null video backend,
   // which is what we want until M3 wires GLContextSwitch into the OGL
@@ -364,7 +409,7 @@ int main(int /*argc*/, char** /*argv*/)
   Config::SetBase(Config::MAIN_AUDIO_MUTED, true);
   DBG_INFO("Forced audio backend = NullSound, muted.");
 
-  const std::string rom_path = "sdmc:/roms/GameCube-240pSuite-1.20.iso";
+  const std::string default_rom_path = "sdmc:/roms/GameCube-240pSuite-1.20.iso";
   bool core_booted = false;
 
   // Hook Core state transitions so we can see the boot progress.
@@ -382,28 +427,49 @@ int main(int /*argc*/, char** /*argv*/)
     DBG_INFO("Core state -> %s", name);
   });
 
-  auto try_boot_rom = [&]() {
+  std::vector<RomEntry> roms = ScanRoms();
+  int selected = roms.empty() ? -1 : 0;
+  std::string status_line = roms.empty() ? std::string{"No ROMs found in sdmc:/roms/"}
+                                         : std::string{"Select a ROM to boot."};
+
+  auto try_boot_rom = [&](const std::string& boot_path) {
     if (core_booted)
       return;
-    if (!std::filesystem::exists(rom_path))
+    if (boot_path.empty())
     {
-      DBG_WARN("ROM not found at %s; skipping boot.", rom_path.c_str());
+      DBG_WARN("No ROM path selected; skipping boot.");
+      status_line = "No ROM selected and no fallback ROM exists.";
       return;
     }
-    DBG_INFO("BootParameters::GenerateFromFile(%s)", rom_path.c_str());
-    auto boot_params = BootParameters::GenerateFromFile(rom_path);
+    std::error_code ec;
+    if (!std::filesystem::exists(boot_path, ec))
+    {
+      DBG_WARN("ROM not found at %s; skipping boot.", boot_path.c_str());
+      status_line = "ROM not found: " + boot_path;
+      return;
+    }
+    DBG_INFO("BootParameters::GenerateFromFile(%s)", boot_path.c_str());
+    status_line = "Booting: " + boot_path;
+    auto boot_params = BootParameters::GenerateFromFile(boot_path);
     if (!boot_params)
     {
       DBG_ERROR("GenerateFromFile returned null — bad ROM or unsupported format.");
+      status_line = "BootParameters::GenerateFromFile failed: " + boot_path;
       return;
     }
     DBG_INFO("BootManager::BootCore starting...");
     core_booted = BootManager::BootCore(Core::System::GetInstance(),
                                         std::move(boot_params), wsi);
     if (core_booted)
+    {
       DBG_INFO("BootCore returned true (Core thread launched).");
+      status_line = "BootCore launched: " + boot_path;
+    }
     else
+    {
       DBG_ERROR("BootCore returned false — boot rejected.");
+      status_line = "BootCore returned false: " + boot_path;
+    }
   };
 
   bool running = true;
@@ -427,8 +493,10 @@ int main(int /*argc*/, char** /*argv*/)
         }
         else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_A)
         {
-          DBG_INFO("A pressed — triggering ROM boot.");
-          try_boot_rom();
+          std::string boot_path = ResolveBootPath(roms, selected, default_rom_path);
+          DBG_INFO("A pressed — triggering ROM boot: %s",
+                   boot_path.empty() ? "(none)" : boot_path.c_str());
+          try_boot_rom(boot_path);
         }
       }
     }
@@ -436,13 +504,6 @@ int main(int /*argc*/, char** /*argv*/)
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
-
-    // ROM browser — M5 wires the actual Core::Init/Run on selection.
-    static std::vector<RomEntry> roms = ScanRoms();
-    static int selected = -1;
-    static std::string status_line = roms.empty()
-                                         ? std::string{"No ROMs found in sdmc:/roms/"}
-                                         : std::string{"Select a ROM to boot."};
 
     ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(720, 600), ImGuiCond_Once);
@@ -454,14 +515,13 @@ int main(int /*argc*/, char** /*argv*/)
       ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Core: BOOTED");
     else
       ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
-                         "Core: not booted — press A to boot %s, + to exit.",
-                         std::filesystem::path(rom_path).filename().string().c_str());
+                         "Core: not booted — press A or Boot selected, + to exit.");
     ImGui::Separator();
 
     if (ImGui::Button("Rescan"))
     {
       roms = ScanRoms();
-      selected = -1;
+      selected = roms.empty() ? -1 : 0;
       status_line = roms.empty() ? std::string{"No ROMs found in sdmc:/roms/"}
                                  : std::string{"Select a ROM to boot."};
     }
@@ -479,8 +539,7 @@ int main(int /*argc*/, char** /*argv*/)
         selected = i;
         if (ImGui::IsMouseDoubleClicked(0))
         {
-          status_line = "Would boot: " + r.path +
-                        " (Core::Init wiring lands in M5 hardware integration)";
+          try_boot_rom(r.path);
         }
       }
     }
@@ -490,10 +549,9 @@ int main(int /*argc*/, char** /*argv*/)
     if (selected >= 0 && selected < static_cast<int>(roms.size()))
     {
       ImGui::Text("Selected: %s", roms[selected].name.c_str());
-      if (ImGui::Button("Boot selected (stub)"))
+      if (ImGui::Button("Boot selected"))
       {
-        status_line = "Would boot: " + roms[selected].path +
-                      " (Core::Init wiring lands in M5 hardware integration)";
+        try_boot_rom(roms[selected].path);
       }
     }
     ImGui::TextWrapped("%s", status_line.c_str());
@@ -559,6 +617,8 @@ int main(int /*argc*/, char** /*argv*/)
   ShutdownGraphics(window, gl_ctx);
 
   UICommon::Shutdown();
+  if (romfs_mounted)
+    romfsExit();
   DBG_INFO("UICommon::Shutdown() returned. Goodbye.");
   dbg::Shutdown();
   CloseNxlink(nxlink_fd);

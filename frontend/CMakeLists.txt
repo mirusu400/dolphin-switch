@@ -56,9 +56,35 @@ target_link_libraries(dolphin-switch-frontend PRIVATE
     nx
 )
 
-# Produce the .nro alongside the ELF. Default icon + auto-generated NACP for now.
+set(DOLPHIN_SWITCH_ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/romfs")
+file(GLOB_RECURSE DOLPHIN_SWITCH_SYS_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/dolphin/Data/Sys/*"
+)
+dkp_add_asset_target(dolphin-switch-romfs "${DOLPHIN_SWITCH_ROMFS_DIR}")
+add_custom_command(
+    OUTPUT "${DOLPHIN_SWITCH_ROMFS_DIR}/.sys-stamp"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${DOLPHIN_SWITCH_ROMFS_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DOLPHIN_SWITCH_ROMFS_DIR}/Sys"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/dolphin/Data/Sys"
+            "${DOLPHIN_SWITCH_ROMFS_DIR}/Sys"
+    COMMAND ${CMAKE_COMMAND} -E touch "${DOLPHIN_SWITCH_ROMFS_DIR}/.sys-stamp"
+    DEPENDS ${DOLPHIN_SWITCH_SYS_FILES}
+    COMMENT "Staging Dolphin Sys files for NRO romfs"
+    VERBATIM
+)
+add_custom_target(dolphin-switch-romfs-stage
+    DEPENDS "${DOLPHIN_SWITCH_ROMFS_DIR}/.sys-stamp"
+)
+add_dependencies(dolphin-switch-romfs dolphin-switch-romfs-stage)
+add_dependencies(dolphin-switch-frontend dolphin-switch-romfs)
+
+# Produce the .nro alongside the ELF. The romfs contains Dolphin's read-only
+# Sys tree at romfs:/Sys/ so boot code can find GameINI, fonts, codehandler,
+# and other compatibility resources without writing them to sdmc:.
 nx_create_nro(dolphin-switch-frontend
     NACP "${CMAKE_CURRENT_BINARY_DIR}/dolphin-switch.nacp"
+    ROMFS dolphin-switch-romfs
 )
 
 # Generate NACP with project metadata (overrides the default name/author).

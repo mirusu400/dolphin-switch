@@ -18,7 +18,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_TYPE="Release"
 DO_CLEAN=0
-JOBS="$(nproc)"
+
+detect_jobs() {
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+    elif command -v getconf >/dev/null 2>&1; then
+        getconf _NPROCESSORS_ONLN
+    elif command -v sysctl >/dev/null 2>&1; then
+        sysctl -n hw.ncpu
+    else
+        echo 4
+    fi
+}
+
+JOBS="$(detect_jobs)"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -66,10 +79,19 @@ cmake -S "$DOLPHIN_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     "${EXTRA_FLAGS[@]}"
 
-# Build only the headless target. A successful link of `dolphin-emu-nogui`
-# is the green-build signal. If it ever passes, then a full GUI build
-# almost certainly will too (any Qt-only breakage doesn't gate Switch).
-cmake --build "$BUILD_DIR" --parallel "$JOBS" --target dolphin-emu-nogui
+# Build only the headless target. Upstream Dolphin has used both
+# `dolphin-emu-nogui` and `dolphin-nogui` for this target across revisions.
+TARGETS="$(cmake --build "$BUILD_DIR" --target help)"
+if grep -q 'dolphin-emu-nogui' <<<"$TARGETS"; then
+    NOGUI_TARGET="dolphin-emu-nogui"
+elif grep -q 'dolphin-nogui' <<<"$TARGETS"; then
+    NOGUI_TARGET="dolphin-nogui"
+else
+    echo "no Dolphin no-gui target found" >&2
+    exit 1
+fi
+
+cmake --build "$BUILD_DIR" --parallel "$JOBS" --target "$NOGUI_TARGET"
 
 echo
-echo "host build OK ($BUILD_TYPE)"
+echo "host build OK ($BUILD_TYPE, target=$NOGUI_TARGET)"

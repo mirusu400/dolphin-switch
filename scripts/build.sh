@@ -12,6 +12,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_TYPE="Release"
 DO_CLEAN=0
 
+detect_jobs() {
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+    elif command -v getconf >/dev/null 2>&1; then
+        getconf _NPROCESSORS_ONLN
+    elif command -v sysctl >/dev/null 2>&1; then
+        sysctl -n hw.ncpu
+    else
+        echo 4
+    fi
+}
+
 for arg in "$@"; do
     case "$arg" in
         --debug) BUILD_TYPE="Debug" ;;
@@ -44,7 +56,7 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 
-cmake --build "$BUILD_DIR" --parallel "$(nproc)"
+cmake --build "$BUILD_DIR" --parallel "$(detect_jobs)"
 
 NRO=$(find "$BUILD_DIR" -name 'dolphin-switch-frontend.nro' -print -quit)
 if [ -n "$NRO" ]; then

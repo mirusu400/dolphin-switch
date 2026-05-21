@@ -17,8 +17,9 @@ Reproducible build env using devkitPro's official image. No host
 toolchain install required besides Docker.
 
 ```sh
-git clone --recurse-submodules <this-repo>
+git clone <this-repo>
 cd dolphin-switch
+./scripts/init-submodules.sh        # repairs nested SFML/curl Switch patches
 ./scripts/docker-build.sh           # release NRO
 ./scripts/docker-build.sh debug     # -O0 + symbols
 ./scripts/docker-build.sh clean     # nuke build/ then rebuild
@@ -42,6 +43,7 @@ If you already have devkitPro installed:
 ```sh
 # One-time toolchain check
 ./scripts/setup-toolchain.sh
+./scripts/init-submodules.sh
 
 # Install Switch portlibs (if not already)
 sudo dkp-pacman -Sy switch-mesa switch-sdl2 switch-zlib switch-libpng switch-pkg-config

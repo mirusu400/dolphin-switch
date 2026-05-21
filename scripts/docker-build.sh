@@ -19,10 +19,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Pass UID/GID through so build artifacts are owned by the invoking user
-# instead of root. Compose reads these from the env at run time.
-export UID="${UID:-$(id -u)}"
-export GID="${GID:-$(id -g)}"
+# Pass the host uid/gid through so build artifacts are owned by the invoking
+# user instead of root. Bash exposes UID as a readonly variable, so use
+# HOST_UID/HOST_GID for compose interpolation.
+export HOST_UID="${HOST_UID:-$(id -u)}"
+export HOST_GID="${HOST_GID:-$(id -g)}"
 
 target="${1:-release}"
 case "$target" in

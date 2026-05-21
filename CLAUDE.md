@@ -66,7 +66,7 @@ Port the Dolphin GameCube/Wii emulator to run as a **native homebrew NRO** on Ni
 ```bash
 # First-time setup (verifies $DEVKITPRO, dependencies)
 ./scripts/setup-toolchain.sh
-git submodule update --init --recursive
+./scripts/init-submodules.sh
 
 # Build the Switch NRO
 ./scripts/build.sh                # release

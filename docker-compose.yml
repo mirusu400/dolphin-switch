@@ -8,14 +8,14 @@
 #
 # All services share the same image and bind-mount the repo at /workspace.
 # User-id mapping ensures the build/ directory ends up owned by you, not
-# root. Set UID/GID env vars before running, or rely on the 1000:1000
-# default which matches most desktop installs.
+# root. Set HOST_UID/HOST_GID env vars before running, or rely on the
+# 1000:1000 default which matches most desktop installs.
 
 services:
   build:
     build: .
     image: dolphin-switch:dev
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       - .:/workspace
     working_dir: /workspace
@@ -24,7 +24,7 @@ services:
   build-debug:
     build: .
     image: dolphin-switch:dev
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       - .:/workspace
     working_dir: /workspace
@@ -33,7 +33,7 @@ services:
   build-clean:
     build: .
     image: dolphin-switch:dev
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       - .:/workspace
     working_dir: /workspace
@@ -42,7 +42,7 @@ services:
   host-build:
     build: .
     image: dolphin-switch:dev
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       - .:/workspace
     working_dir: /workspace
@@ -51,7 +51,7 @@ services:
   shell:
     build: .
     image: dolphin-switch:dev
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       - .:/workspace
     working_dir: /workspace

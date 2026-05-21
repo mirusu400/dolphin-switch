@@ -25,6 +25,16 @@ to record the changes for re-clone is as `git format-patch` files.
 
 ## Re-applying after a fresh clone
 
+Preferred path:
+
+```sh
+./scripts/init-submodules.sh
+```
+
+That script initializes every normal submodule, then checks out the
+upstream base commits for SFML / curl and reapplies the Switch source
+edits locally. Use the manual commands below only if the script breaks.
+
 If the parent repo's `dolphin` submodule is recursively initialized
 and the nested SFML / curl submodules show no `switch-build-prep`
 branch (because they pull from upstream by default):

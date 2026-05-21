@@ -583,3 +583,50 @@ the parent, set its remote, and push.
 
 Top-level CMakeLists.txt: ~30 lines of cache forces + compile
 definitions.
+
+---
+
+## 2026-05-21 - Romfs Sys packaging + frontend boot selection hardening
+
+**Done**
+- Added `scripts/init-submodules.sh` because a plain recursive submodule
+  update fails on the local-only nested SFML/curl pointers. The script
+  initializes normal submodules, checks out the upstream SFML/curl base
+  commits, and reapplies the two Switch source edits locally.
+- Fixed Docker wrapper UID handling: `UID` is readonly in bash, so compose
+  now uses `HOST_UID` / `HOST_GID`.
+- Switch `File::SetSysDirectory()` is now available by extending the
+  Android sys-directory override path in `Common/FileUtil.{h,cpp}` to
+  `__SWITCH__`.
+- `frontend/CMakeLists.txt` stages `dolphin/Data/Sys` into the NRO romfs
+  as `romfs:/Sys/` through devkitPro's asset-target path, so
+  `nx_create_nro` can validate it at configure time and depend on the
+  staging step at build time.
+- `frontend/src/main.cpp` mounts romfs at startup, points Dolphin's Sys
+  directory at `romfs:/Sys`, and falls back to `sdmc:/switch/dolphin/Sys`
+  if romfs mounting fails.
+- Cleaned Switch user-path initialization: `D_USER_IDX` drives Dolphin's
+  normal subdirectory rebuild, and the frontend creates the required dirs
+  instead of overriding individual indices inconsistently.
+- ROM browser boot is no longer a stub. Pressing A, double-clicking a ROM,
+  or pressing "Boot selected" now passes the selected ROM into
+  `BootManager::BootCore`; the old 240p test ISO remains only as a fallback
+  when no selection exists.
+- `scripts/build.sh` and `scripts/build-host.sh` no longer require GNU
+  `nproc`; they fall back to `getconf` / `sysctl` on macOS.
+
+**Verified**
+- `bash -n` passes for all touched shell scripts.
+- `./scripts/init-submodules.sh` completes without the previous SFML
+  missing-commit fatal surfacing to the user.
+- `git diff --check` passes across the parent repo, Dolphin submodule, and
+  the two locally patched nested SFML/curl submodules.
+- Docker release build completes under OrbStack after restarting OrbStack
+  and pre-pulling `devkitpro/devkita64:latest` to clear a partial layerdb
+  failure. Output:
+  `build/switch-release/frontend/dolphin-switch-frontend.nro` (20 MiB).
+
+**Blocked / not verified**
+- Hardware behavior remains untested in this session. Next hardware run
+  should confirm `romfsInit: PASS`, `Dolphin Sys directory: romfs:/Sys/`,
+  and selected-ROM boot reaching the previous Core-thread boundary.

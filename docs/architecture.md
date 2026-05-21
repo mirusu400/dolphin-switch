@@ -186,9 +186,8 @@ We do **not** depend on:
   `dolphin/Source/Core/Common/FileUtil.{h,cpp}`,
   `dolphin/Source/Core/Common/UserPath.{h,cpp}` — all need
   `sdmc:/switch/dolphin/` paths.
-- `dolphin/Sys/` shipped in NRO romfs (read-only). The
-  `nx_create_nro(... ROMFS ...)` argument will package it once we get
-  there.
+- `dolphin/Data/Sys/` is shipped in NRO romfs as `romfs:/Sys/`
+  (read-only) by `frontend/CMakeLists.txt`.
 
 ## Build outputs
 
