@@ -6,10 +6,12 @@
 #include <cstring>
 #include <ctime>
 #include <time.h>  // POSIX timespec / clock_gettime — newlib does not put these in std::
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <switch.h>
 #include <GLES3/gl3.h>
@@ -20,7 +22,7 @@ namespace dbg
 namespace
 {
 constexpr const char* kLogDir = "sdmc:/switch/dolphin/logs";
-constexpr std::size_t kRingCapacity = 1024;
+constexpr std::size_t kRingCapacity = 4096;
 
 std::mutex g_mu;
 std::FILE* g_file = nullptr;
@@ -164,12 +166,10 @@ void LogF(Level level, const char* file, int line, const char* fmt, ...)
   va_end(ap);
 }
 
-const std::deque<std::string>& RingBuffer()
+std::vector<std::string> RingBufferSnapshot()
 {
-  // Caller must observe the threading contract documented in the header
-  // (single-threaded UI access today). Return without locking — copying
-  // the deque on every frame would make the ImGui panel quadratic.
-  return g_ring;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return {g_ring.begin(), g_ring.end()};
 }
 
 void DumpSystemInfo()

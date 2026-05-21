@@ -13,12 +13,17 @@
 //   - Newlib symbol-gap stubs live in switch_libc_shim.c.
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 #include <unistd.h>
@@ -37,8 +42,11 @@
 #include "Common/Version.h"
 #include "Common/FileUtil.h"
 #include "Common/Config/Config.h"
+#include "Common/Logging/Log.h"
+#include "Common/Logging/LogManager.h"
 #include "Common/WindowSystemInfo.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/BootManager.h"
 #include "Core/Boot/Boot.h"
 #include "Core/Core.h"
@@ -115,6 +123,274 @@ struct RomEntry
   std::uintmax_t size_bytes = 0;
 };
 
+const char* CoreStateName(Core::State state)
+{
+  switch (state)
+  {
+  case Core::State::Uninitialized:
+    return "Uninitialized";
+  case Core::State::Paused:
+    return "Paused";
+  case Core::State::Running:
+    return "Running";
+  case Core::State::Starting:
+    return "Starting";
+  case Core::State::Stopping:
+    return "Stopping";
+  }
+  return "?";
+}
+
+dbg::Level ToDbgLevel(Common::Log::LogLevel level)
+{
+  switch (level)
+  {
+  case Common::Log::LogLevel::LERROR:
+    return dbg::Level::Error;
+  case Common::Log::LogLevel::LWARNING:
+    return dbg::Level::Warn;
+  case Common::Log::LogLevel::LDEBUG:
+    return dbg::Level::Debug;
+  case Common::Log::LogLevel::LNOTICE:
+  case Common::Log::LogLevel::LINFO:
+    return dbg::Level::Info;
+  }
+  return dbg::Level::Info;
+}
+
+class DolphinLogBridge final : public Common::Log::LogListener
+{
+public:
+  void Log(Common::Log::LogLevel level, const char* msg) override
+  {
+    std::string line = msg ? msg : "";
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+      line.pop_back();
+
+    dbg::LogF(ToDbgLevel(level), "dolphin-log", 0, "%s", line.c_str());
+  }
+};
+
+void EnableDolphinDiagnosticLogs()
+{
+  auto* log_manager = Common::Log::LogManager::GetInstance();
+  if (!log_manager)
+  {
+    DBG_WARN("Dolphin LogManager is not initialized; core log bridge disabled.");
+    return;
+  }
+
+  log_manager->RegisterListener(Common::Log::LogListener::LOG_WINDOW_LISTENER,
+                                std::make_unique<DolphinLogBridge>());
+  log_manager->EnableListener(Common::Log::LogListener::LOG_WINDOW_LISTENER, true);
+  log_manager->SetConfigLogLevel(Common::Log::LogLevel::LINFO);
+
+  constexpr Common::Log::LogType kDiagnosticTypes[] = {
+      Common::Log::LogType::AUDIO,
+      Common::Log::LogType::BOOT,
+      Common::Log::LogType::COMMON,
+      Common::Log::LogType::CONSOLE,
+      Common::Log::LogType::CONTROLLERINTERFACE,
+      Common::Log::LogType::CORE,
+      Common::Log::LogType::DISCIO,
+      Common::Log::LogType::DSPHLE,
+      Common::Log::LogType::DVDINTERFACE,
+      Common::Log::LogType::IOS,
+      Common::Log::LogType::IOS_DI,
+      Common::Log::LogType::IOS_ES,
+      Common::Log::LogType::IOS_FS,
+      Common::Log::LogType::MEMMAP,
+      Common::Log::LogType::OSREPORT,
+      Common::Log::LogType::OSREPORT_HLE,
+      Common::Log::LogType::POWERPC,
+      Common::Log::LogType::VIDEO,
+      Common::Log::LogType::VIDEOINTERFACE,
+  };
+  for (const Common::Log::LogType type : kDiagnosticTypes)
+    log_manager->SetEnable(type, true);
+
+  DBG_INFO("Dolphin diagnostic log bridge enabled (%zu log types, verbosity=LINFO).",
+           sizeof(kDiagnosticTypes) / sizeof(kDiagnosticTypes[0]));
+}
+
+void LogMemorySnapshot(std::string_view label)
+{
+  u64 total_mem = 0;
+  u64 used_mem = 0;
+  const Result total_rc = svcGetInfo(&total_mem, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+  const Result used_rc = svcGetInfo(&used_mem, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+
+  if (R_SUCCEEDED(total_rc) && R_SUCCEEDED(used_rc))
+  {
+    const u64 free_mem = total_mem > used_mem ? total_mem - used_mem : 0;
+    DBG_INFO("Memory[%.*s]: total=%llu MiB used=%llu MiB free=%llu MiB",
+             static_cast<int>(label.size()), label.data(),
+             static_cast<unsigned long long>(total_mem >> 20),
+             static_cast<unsigned long long>(used_mem >> 20),
+             static_cast<unsigned long long>(free_mem >> 20));
+    return;
+  }
+
+  DBG_WARN("Memory[%.*s]: svcGetInfo failed total_rc=0x%08X used_rc=0x%08X",
+           static_cast<int>(label.size()), label.data(), total_rc, used_rc);
+}
+
+void LogPathProbe(const char* label, const std::string& path)
+{
+  std::error_code ec;
+  const bool exists = std::filesystem::exists(path, ec);
+  const std::string exists_error = ec ? ec.message() : "ok";
+
+  bool is_dir = false;
+  bool is_file = false;
+  std::uintmax_t size = 0;
+  if (exists)
+  {
+    ec.clear();
+    is_dir = std::filesystem::is_directory(path, ec);
+    ec.clear();
+    is_file = std::filesystem::is_regular_file(path, ec);
+    if (is_file)
+    {
+      ec.clear();
+      size = std::filesystem::file_size(path, ec);
+    }
+  }
+
+  DBG_INFO("Path[%s]: '%s' exists=%d dir=%d file=%d size=%llu exists_ec=%s",
+           label, path.c_str(), exists ? 1 : 0, is_dir ? 1 : 0, is_file ? 1 : 0,
+           static_cast<unsigned long long>(size), exists_error.c_str());
+}
+
+void LogDolphinPathSummary()
+{
+  DBG_INFO("Dolphin paths: user=%s sys=%s config=%s cache=%s logs=%s mainlog=%s",
+           File::GetUserPath(D_USER_IDX).c_str(), File::GetSysDirectory().c_str(),
+           File::GetUserPath(D_CONFIG_IDX).c_str(), File::GetUserPath(D_CACHE_IDX).c_str(),
+           File::GetUserPath(D_LOGS_IDX).c_str(), File::GetUserPath(F_MAINLOG_IDX).c_str());
+  DBG_INFO("Dolphin paths: wiiroot=%s session_wiiroot=%s gcuser=%s gamesettings=%s",
+           File::GetUserPath(D_WIIROOT_IDX).c_str(),
+           File::GetUserPath(D_SESSION_WIIROOT_IDX).c_str(),
+           File::GetUserPath(D_GCUSER_IDX).c_str(),
+           File::GetUserPath(D_GAMESETTINGS_IDX).c_str());
+
+  LogPathProbe("user-root", File::GetUserPath(D_USER_IDX));
+  LogPathProbe("sys-root", File::GetSysDirectory());
+  LogPathProbe("sys-gamesettings", File::GetSysDirectory() + "GameSettings");
+  LogPathProbe("rom-dir", kRomDir);
+}
+
+void LogSdlInputProbe()
+{
+  const int joystick_count = SDL_NumJoysticks();
+  int controller_count = 0;
+  DBG_INFO("SDL input probe: joysticks=%d", joystick_count);
+  for (int i = 0; i < joystick_count; ++i)
+  {
+    const SDL_bool is_controller = SDL_IsGameController(i);
+    if (is_controller)
+      ++controller_count;
+    DBG_INFO("SDL input[%d]: gamecontroller=%d name=%s", i, is_controller ? 1 : 0,
+             SDL_GameControllerNameForIndex(i) ? SDL_GameControllerNameForIndex(i) : "(null)");
+  }
+  DBG_INFO("SDL input probe: gamecontrollers=%d", controller_count);
+}
+
+void LogGlError(const char* label)
+{
+  bool saw_error = false;
+  for (int i = 0; i < 8; ++i)
+  {
+    const GLenum err = glGetError();
+    if (err == GL_NO_ERROR)
+      break;
+    saw_error = true;
+    DBG_WARN("GL error after %s: 0x%04X", label, err);
+  }
+
+  if (!saw_error)
+    DBG_DEBUG("GL error check after %s: clean", label);
+}
+
+const char* BootParameterTypeName(const BootParameters& boot)
+{
+  if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
+    return "Disc";
+  if (std::holds_alternative<BootParameters::Executable>(boot.parameters))
+    return "Executable";
+  if (std::holds_alternative<DiscIO::VolumeWAD>(boot.parameters))
+    return "WAD";
+  if (std::holds_alternative<BootParameters::NANDTitle>(boot.parameters))
+    return "NANDTitle";
+  if (std::holds_alternative<BootParameters::IPL>(boot.parameters))
+    return "IPL";
+  if (std::holds_alternative<BootParameters::DFF>(boot.parameters))
+    return "DFF";
+  return "?";
+}
+
+void LogBootParameters(const BootParameters& boot)
+{
+  DBG_INFO("BootParameters: type=%s riivolution_patches=%zu savestate=%s netplay=%d",
+           BootParameterTypeName(boot), boot.riivolution_patches.size(),
+           boot.boot_session_data.GetSavestatePath()
+               ? boot.boot_session_data.GetSavestatePath()->c_str()
+               : "(none)",
+           boot.boot_session_data.GetNetplaySettings() ? 1 : 0);
+
+  std::visit(
+      [](const auto& params) {
+        using T = std::decay_t<decltype(params)>;
+        if constexpr (std::is_same_v<T, BootParameters::Disc>)
+        {
+          DBG_INFO("BootParameters::Disc path=%s auto_disc_change_paths=%zu volume=%p",
+                   params.path.c_str(), params.auto_disc_change_paths.size(), params.volume.get());
+        }
+        else if constexpr (std::is_same_v<T, BootParameters::Executable>)
+        {
+          DBG_INFO("BootParameters::Executable path=%s reader=%p", params.path.c_str(),
+                   params.reader.get());
+        }
+        else if constexpr (std::is_same_v<T, DiscIO::VolumeWAD>)
+        {
+          DBG_INFO("BootParameters::WAD");
+        }
+        else if constexpr (std::is_same_v<T, BootParameters::NANDTitle>)
+        {
+          DBG_INFO("BootParameters::NANDTitle id=0x%016llX",
+                   static_cast<unsigned long long>(params.id));
+        }
+        else if constexpr (std::is_same_v<T, BootParameters::IPL>)
+        {
+          DBG_INFO("BootParameters::IPL path=%s has_disc=%d region=%d", params.path.c_str(),
+                   params.disc ? 1 : 0, static_cast<int>(params.region));
+        }
+        else if constexpr (std::is_same_v<T, BootParameters::DFF>)
+        {
+          DBG_INFO("BootParameters::DFF path=%s", params.dff_path.c_str());
+        }
+      },
+      boot.parameters);
+}
+
+void LogDolphinConfigSummary(const char* label)
+{
+  const SConfig& startup = SConfig::GetInstance();
+  DBG_INFO("Config[%s]: gfx=%s cpu_core=%d cpu_thread=%d fastmem=%d arena=%d skip_ipl=%d",
+           label, Config::Get(Config::MAIN_GFX_BACKEND).c_str(),
+           static_cast<int>(Config::Get(Config::MAIN_CPU_CORE)),
+           Config::Get(Config::MAIN_CPU_THREAD) ? 1 : 0,
+           Config::Get(Config::MAIN_FASTMEM) ? 1 : 0,
+           Config::Get(Config::MAIN_FASTMEM_ARENA) ? 1 : 0,
+           Config::Get(Config::MAIN_SKIP_IPL) ? 1 : 0);
+  DBG_INFO("Config[%s]: dsp_hle=%d dsp_thread=%d audio=%s muted=%d region=%d game_id=%s title=%s",
+           label, Config::Get(Config::MAIN_DSP_HLE) ? 1 : 0,
+           Config::Get(Config::MAIN_DSP_THREAD) ? 1 : 0,
+           Config::Get(Config::MAIN_AUDIO_BACKEND).c_str(),
+           Config::Get(Config::MAIN_AUDIO_MUTED) ? 1 : 0, static_cast<int>(startup.m_region),
+           startup.GetGameID().c_str(), startup.GetTitleDescription().c_str());
+}
+
 bool IsRomExt(const std::filesystem::path& p)
 {
   std::string ext = p.extension().string();
@@ -124,6 +400,8 @@ bool IsRomExt(const std::filesystem::path& p)
          ext == ".rvz" || ext == ".wbfs" || ext == ".wad" || ext == ".dol" ||
          ext == ".elf";
 }
+
+std::string FormatSize(std::uintmax_t bytes);
 
 std::vector<RomEntry> ScanRoms()
 {
@@ -158,6 +436,13 @@ std::vector<RomEntry> ScanRoms()
   std::sort(roms.begin(), roms.end(),
             [](const RomEntry& a, const RomEntry& b) { return a.name < b.name; });
   DBG_INFO("ScanRoms: %zu entries in %s", roms.size(), kRomDir);
+  for (std::size_t i = 0; i < roms.size() && i < 64; ++i)
+  {
+    DBG_INFO("ROM[%zu]: %s size=%s path=%s", i, roms[i].name.c_str(),
+             FormatSize(roms[i].size_bytes).c_str(), roms[i].path.c_str());
+  }
+  if (roms.size() > 64)
+    DBG_WARN("ScanRoms: only first 64 ROMs logged; total=%zu", roms.size());
   return roms;
 }
 
@@ -260,6 +545,7 @@ int main(int /*argc*/, char** /*argv*/)
 
   DBG_INFO("dolphin-switch boot — version %s", Common::GetScmRevStr().c_str());
   DBG_INFO("nxlink fd: %d (negative = no host listening)", nxlink_fd);
+  LogMemorySnapshot("early boot");
 
   bool romfs_mounted = false;
   Result romfs_rc = romfsInit();
@@ -314,10 +600,13 @@ int main(int /*argc*/, char** /*argv*/)
     File::SetSysDirectory(fallback_sys_dir);
   }
   DBG_INFO("Dolphin Sys directory: %s", File::GetSysDirectory().c_str());
+  LogDolphinPathSummary();
 
   DBG_INFO("Calling UICommon::Init()...");
   UICommon::Init();
   DBG_INFO("UICommon::Init() returned.");
+  EnableDolphinDiagnosticLogs();
+  LogDolphinConfigSummary("after UICommon::Init");
 
   // Tear down the early console before SDL grabs the framebuffer.
   consoleExit(nullptr);
@@ -334,12 +623,14 @@ int main(int /*argc*/, char** /*argv*/)
     CloseNxlink(nxlink_fd);
     return 1;
   }
+  LogSdlInputProbe();
 
   // System probe AFTER GL is up — GL strings only valid once a context is
   // current. This is the single most important diagnostic for hardware
   // bring-up: shows JIT cap, memory budget, GL_VENDOR/RENDERER/VERSION,
   // applet state — everything we need to triage a Switch boot.
   dbg::DumpSystemInfo();
+  LogGlError("runtime probe");
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -352,6 +643,7 @@ int main(int /*argc*/, char** /*argv*/)
   // *_glsl_300_es shader (which prepends `precision mediump float;`).
   ImGui_ImplOpenGL3_Init("#version 300 es");
   DBG_INFO("ImGui SDL2+GLES backends initialized.");
+  LogGlError("ImGui backend init");
 
   // ---------------------------------------------------------------------
   // Direct ROM boot (M2-stage hardware bring-up).
@@ -408,23 +700,17 @@ int main(int /*argc*/, char** /*argv*/)
   Config::SetBase(Config::MAIN_AUDIO_BACKEND, std::string{BACKEND_NULLSOUND});
   Config::SetBase(Config::MAIN_AUDIO_MUTED, true);
   DBG_INFO("Forced audio backend = NullSound, muted.");
+  LogDolphinConfigSummary("forced Switch base config");
 
   const std::string default_rom_path = "sdmc:/roms/GameCube-240pSuite-1.20.iso";
+  LogPathProbe("default-rom-fallback", default_rom_path);
   bool core_booted = false;
 
   // Hook Core state transitions so we can see the boot progress.
   // EventHook is [[nodiscard]] — keep alive for the whole frontend lifetime.
   static auto state_hook = Core::AddOnStateChangedCallback([](Core::State state) {
-    const char* name = "?";
-    switch (state)
-    {
-    case Core::State::Uninitialized: name = "Uninitialized"; break;
-    case Core::State::Paused:        name = "Paused";        break;
-    case Core::State::Running:       name = "Running";       break;
-    case Core::State::Starting:      name = "Starting";      break;
-    case Core::State::Stopping:      name = "Stopping";      break;
-    }
-    DBG_INFO("Core state -> %s", name);
+    DBG_INFO("Core state -> %s", CoreStateName(state));
+    LogMemorySnapshot("Core state change");
   });
 
   std::vector<RomEntry> roms = ScanRoms();
@@ -434,13 +720,18 @@ int main(int /*argc*/, char** /*argv*/)
 
   auto try_boot_rom = [&](const std::string& boot_path) {
     if (core_booted)
+    {
+      DBG_WARN("Boot request ignored because core is already booted; state=%s",
+               CoreStateName(Core::GetState(Core::System::GetInstance())));
       return;
+    }
     if (boot_path.empty())
     {
       DBG_WARN("No ROM path selected; skipping boot.");
       status_line = "No ROM selected and no fallback ROM exists.";
       return;
     }
+    LogPathProbe("boot-rom", boot_path);
     std::error_code ec;
     if (!std::filesystem::exists(boot_path, ec))
     {
@@ -448,33 +739,67 @@ int main(int /*argc*/, char** /*argv*/)
       status_line = "ROM not found: " + boot_path;
       return;
     }
+    LogMemorySnapshot("before GenerateFromFile");
     DBG_INFO("BootParameters::GenerateFromFile(%s)", boot_path.c_str());
     status_line = "Booting: " + boot_path;
+    const auto generate_start = std::chrono::steady_clock::now();
     auto boot_params = BootParameters::GenerateFromFile(boot_path);
+    const auto generate_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - generate_start)
+                                 .count();
     if (!boot_params)
     {
-      DBG_ERROR("GenerateFromFile returned null — bad ROM or unsupported format.");
+      DBG_ERROR("GenerateFromFile returned null after %lld ms — bad ROM or unsupported format.",
+                static_cast<long long>(generate_ms));
       status_line = "BootParameters::GenerateFromFile failed: " + boot_path;
       return;
     }
+    DBG_INFO("GenerateFromFile returned %s in %lld ms.", BootParameterTypeName(*boot_params),
+             static_cast<long long>(generate_ms));
+    LogBootParameters(*boot_params);
+    LogDolphinConfigSummary("before BootCore");
+    LogMemorySnapshot("before BootCore");
+
     DBG_INFO("BootManager::BootCore starting...");
+    const auto boot_start = std::chrono::steady_clock::now();
     core_booted = BootManager::BootCore(Core::System::GetInstance(),
                                         std::move(boot_params), wsi);
+    const auto boot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - boot_start)
+                             .count();
+    LogMemorySnapshot("after BootCore");
+    LogDolphinConfigSummary("after BootCore");
     if (core_booted)
     {
-      DBG_INFO("BootCore returned true (Core thread launched).");
+      DBG_INFO("BootCore returned true after %lld ms (Core thread launched).",
+               static_cast<long long>(boot_ms));
       status_line = "BootCore launched: " + boot_path;
     }
     else
     {
-      DBG_ERROR("BootCore returned false — boot rejected.");
+      DBG_ERROR("BootCore returned false after %lld ms — boot rejected.",
+                static_cast<long long>(boot_ms));
       status_line = "BootCore returned false: " + boot_path;
     }
   };
 
   bool running = true;
+  std::uint64_t frame_counter = 0;
+  auto last_heartbeat = std::chrono::steady_clock::now();
   while (running && appletMainLoop())
   {
+    ++frame_counter;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_heartbeat >= std::chrono::seconds(5))
+    {
+      last_heartbeat = now;
+      DBG_DEBUG("Heartbeat: frame=%llu core_booted=%d core_state=%s roms=%zu selected=%d",
+                static_cast<unsigned long long>(frame_counter), core_booted ? 1 : 0,
+                CoreStateName(Core::GetState(Core::System::GetInstance())), roms.size(),
+                selected);
+      LogMemorySnapshot("heartbeat");
+    }
+
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
@@ -571,7 +896,7 @@ int main(int /*argc*/, char** /*argv*/)
       ImGui::Separator();
       ImGui::BeginChild("log_scroll", ImVec2(0, 0), false,
                         ImGuiWindowFlags_HorizontalScrollbar);
-      const auto& ring = dbg::RingBuffer();
+      const auto ring = dbg::RingBufferSnapshot();
       for (const auto& l : ring)
       {
         ImVec4 color(0.85f, 0.85f, 0.85f, 1.0f);

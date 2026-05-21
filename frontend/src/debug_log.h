@@ -4,8 +4,8 @@
 //   1. stdout/stderr (visible on PC via `nxlink -s`)
 //   2. SD file at `sdmc:/switch/dolphin/logs/dolphin-switch-YYYYMMDD-HHMMSS.log`
 //      (flushed every line so a crash leaves a trail)
-//   3. In-process ring buffer for the ImGui log window (capped, lock-free reads
-//      on the UI thread because writes happen on the same thread today)
+//   3. In-process ring buffer for the ImGui log window (capped, snapshot reads
+//      so Dolphin's emulation thread can write diagnostics safely)
 //
 // Use the DBG_* macros at call sites — they capture file/line so the log shows
 // where each line came from. Hardware bring-up code should emit liberally;
@@ -15,8 +15,8 @@
 
 #include <cstdarg>
 #include <cstddef>
-#include <deque>
 #include <string>
+#include <vector>
 
 namespace dbg
 {
@@ -46,9 +46,8 @@ void LogF(Level level, const char* file, int line, const char* fmt, ...);
 // state. Call once after SDL/GL are up.
 void DumpSystemInfo();
 
-// Snapshot the in-process ring buffer for the ImGui log window. Returned by
-// const-ref; caller must not store the reference across DBG_* calls.
-const std::deque<std::string>& RingBuffer();
+// Snapshot the in-process ring buffer for the ImGui log window.
+std::vector<std::string> RingBufferSnapshot();
 
 }  // namespace dbg
 
