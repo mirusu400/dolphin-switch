@@ -208,7 +208,27 @@ void DumpSystemInfo()
   if (R_SUCCEEDED(jit_rc))
   {
     DBG_INFO("JIT capability probe: PASS (jitCreate(1MiB) ok)");
-    DBG_INFO("  rw_addr=%p rx_addr=%p", jitGetRwAddr(&probe), jitGetRxAddr(&probe));
+    void* rw = jitGetRwAddr(&probe);
+    void* rx = jitGetRxAddr(&probe);
+    DBG_INFO("  rw_addr=%p rx_addr=%p", rw, rx);
+
+    // Bake `MOV X0, #0x42; RET` into rw, transition to exec, call via rx.
+    // 0xD2800840: movz x0, #0x42
+    // 0xD65F03C0: ret
+    Result tw = jitTransitionToWritable(&probe);
+    DBG_INFO("  jitTransitionToWritable rc=0x%08X", tw);
+    uint32_t* rw_code = static_cast<uint32_t*>(rw);
+    rw_code[0] = 0xD2800840u;
+    rw_code[1] = 0xD65F03C0u;
+    Result te = jitTransitionToExecutable(&probe);
+    DBG_INFO("  jitTransitionToExecutable rc=0x%08X", te);
+    using StubFn = uint64_t (*)();
+    StubFn stub = reinterpret_cast<StubFn>(rx);
+    DBG_INFO("  calling stub at rx=%p ...", rx);
+    uint64_t ret = stub();
+    DBG_INFO("  stub returned 0x%llx (expected 0x42)",
+             static_cast<unsigned long long>(ret));
+
     jitClose(&probe);
   }
   else

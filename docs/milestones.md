@@ -630,3 +630,398 @@ definitions.
 - Hardware behavior remains untested in this session. Next hardware run
   should confirm `romfsInit: PASS`, `Dolphin Sys directory: romfs:/Sys/`,
   and selected-ROM boot reaching the previous Core-thread boundary.
+
+---
+
+## 2026-05-27 - M3 probe + GLContextSwitch wiring
+
+**Hardware test of prior session (M1+M2 NRO with romfs Sys)**
+
+- Deploy via nxlink to 192.168.1.16:28280 succeeded; runtime log
+  captured.
+- `romfsInit: OK`, Dolphin Sys dir resolved to `romfs:/Sys/`.
+- JIT capability probe PASS — confirmed `rw_addr != rx_addr` (distinct
+  VA aliases, matches `docs/jit-memory.md`).
+- BootCore took selected ROM and entered the PowerPC interpreter; ran
+  60+ seconds with no crash (frame counter 3555 → 92833, ~1.5kfps on
+  the frontend heartbeat).
+- `Null` video backend forced previously — no visible game frame
+  expected, only validating the core path.
+- 22× `IOS_FS` write failures during Wii NAND bootstrap (non-fatal,
+  GameCube path doesn't need them).
+- SDL gamecontroller enumeration runs AFTER `UICommon::InitControllers`
+  — "No default device" warning, harmless.
+- Memory heartbeat is misleading because `hbloader` reserves the whole
+  3.2 GiB pool up front, so `/proc`-equivalent stats look the same
+  before and after BootCore.
+
+**M3 probe — OGL backend on Headless WSI**
+
+Forced `MAIN_GFX_BACKEND=OGL` + `GFX_PREFER_GLES=true` with
+`WindowSystemType::Headless`, leaving Dolphin's `GLContextEGL` to
+create its own pbuffer surface on the video thread.
+
+Findings:
+- `GLContextEGL::Initialize` succeeded on Mesa nouveau / GLES 3.2.
+- `ShaderCache` opened and round-tripped under `sdmc:/switch/dolphin/`.
+- 4 missing OGL extensions on this Mesa build (`GL_ARB_pinned_memory`,
+  `GL_ARB_get_program_binary`-shape `ShaderCache`, `GL_ARB_clip_control`,
+  `GL_ARB_depth_clamp`) — Dolphin has documented fallback paths for all
+  four, so the backend still initialized.
+- 60 s interpreter run again, frames advanced. Render output went to
+  the offscreen pbuffer (expected with Headless WSI), so no visible
+  game frame on the panel.
+- Confirms the OGL backend + Mesa stack is usable; the only thing
+  missing for first frame is wiring Dolphin's GL output to the live
+  SDL/NWindow surface.
+
+**Code landed — M3 GLContextSwitch**
+
+- `Common/WindowSystemInfo.h` — added `WindowSystemType::Switch`.
+- `Common/GL/GLInterface/Switch.{h,cpp}` — new
+  `GLContextSwitch` that adopts EGL display/surface/context handed in
+  through `WindowSystemInfo`. WSI mapping is
+  `display_connection→EGLDisplay`, `render_surface→EGLSurface`,
+  `render_window→EGLContext`. `CreateSharedContext()` uses the saved
+  `EGLConfig` (looked up via `EGL_CONFIG_ID` of the inherited context)
+  so async shader compiler threads can build their own contexts.
+  `IsHeadless()` returns false so the OGL backend will render to the
+  shared surface and `eglSwapBuffers` will hit the NWindow.
+- `Common/GL/GLContext.cpp` — added Switch dispatch arm under
+  `#if defined(__SWITCH__) && HAVE_EGL`.
+- `Common/CMakeLists.txt` — registers `Switch.cpp/.h` when
+  `NINTENDO_SWITCH` and `EGL_FOUND`.
+- Top-level `CMakeLists.txt` — `ENABLE_EGL=ON` so `find_package(EGL)`
+  runs and `HAVE_EGL=1` is exposed.
+- `frontend/src/main.cpp`:
+  - After `SDL_GL_CreateContext` + `SDL_GL_MakeCurrent`, capture
+    `eglGetCurrentDisplay/Surface/Context` and stash them in `wsi`.
+  - `wsi.type = WindowSystemType::Switch`.
+  - Right before `BootManager::BootCore`, call
+    `SDL_GL_MakeCurrent(window, nullptr)` so the video thread can
+    `eglMakeCurrent` on the same handles inside
+    `GLContextSwitch::MakeCurrent`. EGL contexts are single-thread,
+    so this hand-off is mandatory.
+  - Main loop now skips all ImGui draws + `SDL_GL_SwapWindow` while
+    `core_booted` is true. The video thread owns the surface and
+    swaps it directly; if the main thread also swapped, the two
+    pipelines would race for the context.
+
+**Build**
+
+- Docker release build clean on macOS host (`./scripts/docker-build.sh
+  release`). NRO size 21 MiB.
+
+**Next**
+
+- Reopen netloader, deploy this NRO, capture nxlink runtime log.
+  Goal: first visible game frame from the OGL backend. Expect to see
+  `GLContextSwitch: adopt display=… surface=… context=…` followed by
+  the existing OGL init banner and shader compile path, with the
+  panel finally showing a rendered frame instead of the ImGui browser.
+- Once first frame lands, M3 done-criterion is met.
+- Open questions for the first hardware run:
+  - Does `eglQuerySurface(m_surface, EGL_WIDTH/HEIGHT)` return the
+    1280×720 (handheld) or 1920×1080 (docked) backing size, or the
+    SDL fullscreen request? Dolphin's `m_backbuffer_width/height`
+    needs to match the NWindow.
+  - Async shader compiler `CreateSharedContext` path — `eglCreateContext`
+    with `EGL_CONTEXT_CLIENT_VERSION=3` against the captured
+    `EGLConfig` should succeed on Mesa nouveau but has not yet been
+    exercised. If it fails, fall back to single-threaded shader compile.
+
+## 2026-05-27 (afternoon) — M3 first frame swapped to NWindow
+
+Continuation of the morning M3 wiring. Three runtime bugs surfaced during
+the first hardware tests; after fixing them the OGL backend swaps a real
+EGL frame to the NWindow.
+
+**Bug 1 — `eglMakeCurrent` returned `EGL_BAD_ACCESS` (0x3002).**
+
+Trace: Dolphin's OGL backend calls `GLContext::Create()` twice. The
+first call comes from `PopulateBackendInfo` on the frontend thread to
+probe caps (a throwaway context that is then dropped). The second call
+runs on `EmuThread` inside `VideoBackend::Initialize` for the real
+context. Because the first `GLContextSwitch` instance never released
+the EGL binding before destruction, `EmuThread`'s `MakeCurrent` on the
+same SDL/NWindow context failed — EGL contexts are single-thread.
+
+Fix: `GLContextSwitch::~GLContextSwitch()` always calls
+`eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)`
+before destroying any owned resources. That is a no-op on threads that
+do not hold the binding and a release on the one that does, so the
+throwaway probe context's destructor unblocks the real video thread.
+
+**Bug 2 — `eglCreatePbufferSurface` for shared contexts failed (0x3009 = EGL_BAD_MATCH).**
+
+The original `CreateSharedContext` gave each async-shader worker its
+own 1×1 pbuffer to avoid stealing the main NWindow surface. Mesa
+nouveau on Switch picks an `EGLConfig` with `EGL_SURFACE_TYPE =
+EGL_WINDOW_BIT` only, so pbuffer creation is rejected by spec.
+
+Fix: query `EGL_KHR_surfaceless_context` and prefer it. Mesa exposes
+it for GLES3, so workers can `eglMakeCurrent` with
+`EGL_NO_SURFACE` for both draw/read targets and the shared context.
+Pbuffer is left as a fallback for hosts that lack the extension.
+Confirmed at runtime: `CreateSharedContext ok (surfaceless=true)`.
+
+**Bug 3 — ImGui assertion `Need a positive DeltaTime!`.**
+
+`VideoCommon/OnScreenUI.cpp::BeginImGuiFrameUnlocked` computes
+`time_diff_secs = (NowUs() - last) / 1e6`. On Switch the wall-clock
+granularity is coarser than the gap between back-to-back ShaderCache
+loading-frame ticks, so two adjacent `BeginImGuiFrame` calls land in
+the same microsecond and produce a zero delta. ImGui asserts on
+`DeltaTime <= 0` after the very first frame.
+
+Fix: clamp `time_diff_secs` to a tiny positive value
+(`1.0 / 60000` ≈ 16.7 µs) so a 0-µs sample becomes a believable
+single-frame slice instead of triggering the assertion. Patch is
+inside the same file; harmless on hosts with finer-grain timers
+because their delta is already > 0.
+
+**Bug 4 — pure Interpreter never produced a second frame.**
+
+With `CPUCore::Interpreter`, the PowerPC dispatcher executed maybe
+100 k instructions/sec on Cortex-A57, so the 240p Test Suite never
+finished its boot-time MMIO probe and never wrote an XFB. Result:
+exactly **one** `eglSwapBuffers` fired — `OnScreenUI::Initialize`
+clearing the backbuffer — and the panel showed solid black.
+
+Decision: switch the forced CPU core to
+`PowerPC::CPUCore::CachedInterpreter`. Cached Interpreter stores
+function pointers + operand structs in a `Common::CodeBlock<…, false>`
+buffer — `executable=false`, so it goes through
+`AllocateMemoryPages` rather than `AllocateExecutableMemory`. No JIT
+pages, no libnx `jit_t`, no kernel capability dance — runs everywhere
+pure Interpreter runs, but ~10–100× faster. M2 (real Arm64 JIT) is
+still future work; this just buys us a usable dev-loop until M2 lands.
+
+**Runtime result**
+
+- All three EGL surfaces healthy: main NWindow swap target plus two
+  surfaceless worker contexts.
+- `GLContextSwitch::MakeCurrent` succeeds on both passes (probe +
+  real `EmuThread`).
+- `Core::State` reaches `Running`.
+- First `eglSwapBuffers` lands on the NWindow:
+  `GLContextSwitch::Swap #1 ok=1 err=0x0000 surf=…`.
+- M3 done-criterion *technically* met — first OGL frame swapped to
+  the Switch display.
+
+**Caveats still on the floor**
+
+- The first swap is just the cleared backbuffer; no game pixels yet.
+  240p Test Suite is spin-waiting on an unhandled MMIO at
+  `0x0c00688c` / `0x0c0068b4` and never writes an XFB, so `Presenter`
+  never fires again. Cached Interpreter is much faster than pure
+  Interpreter but still very slow — a real boot may take many
+  minutes. Speed is M2 territory.
+- The frontend exits / freezes after several minutes of guest spin.
+  Cause unknown — could be guest deadlock surfaced through Dolphin,
+  or main-loop / Core thread interaction. Untriaged.
+- `Missing OGL Extensions: PinnedMemory ShaderCache ClipControl
+  DepthClamp` warnings persist; Dolphin's fallback paths handle them
+  but they explain part of the slowness.
+
+**Code landed (this session)**
+
+- `dolphin/Source/Core/Common/GL/GLInterface/Switch.cpp` —
+  destructor releases EGL binding; `CreateSharedContext` prefers
+  surfaceless context; `Swap` logs first 5 + every 60th call so we
+  can tell whether the pipeline is alive.
+- `dolphin/Source/Core/VideoCommon/OnScreenUI.cpp` — clamp ImGui
+  `DeltaTime` floor to avoid the zero-delta assertion.
+- `frontend/src/main.cpp` — forced CPU core flipped from
+  `Interpreter` to `CachedInterpreter`.
+
+**Next**
+
+- M2 (libnx `jit_t` JitArm64 backend) is the real unblocker — pure
+  speed is what's keeping us from a visible game frame.
+- Investigate the late freeze (instrument the main loop with a
+  per-iteration log or watchdog, or attach a Switch crash report
+  via `creport`).
+- Optional: render a placeholder via OnScreenDisplay so the panel
+  shows *something* (game id, current state, FPS) before the guest
+  produces an XFB.
+
+## 2026-05-27 (afternoon, second pass) — late-freeze diagnostic + M2 step 4 probe
+
+Two threads in parallel this session.
+
+### Late-freeze diagnostic
+
+Hypothesis: after `OnScreenUI::Initialize` swaps the cleared backbuffer
+once and the 240p Test Suite spin-waits on unhandled MMIO, neither
+thread fires another `eglSwapBuffers` for many minutes. The main loop
+gates GL while `core_booted == true` (M3 morning patch), and the
+video thread's Presenter only ticks when a frame is ready — which the
+guest never produces. The leading suspect for the user-visible "freeze"
+is therefore a stalled swap pipeline being interpreted by the Switch
+NWindow compositor / applet as an unresponsive foreground.
+
+Instrumentation landed:
+
+- `dolphin/Source/Core/Common/GL/GLInterface/Switch.cpp` — added two
+  process-global atomics updated on every `Swap()`:
+  - `g_swap_count` — total `eglSwapBuffers` calls so far.
+  - `g_last_swap_us` — steady-clock microsecond timestamp of the most
+    recent swap.
+- New `extern "C" DolphinSwitchGetSwapStats(uint64_t*, uint64_t*)` so
+  the frontend can read both without dragging in EGL headers.
+- `frontend/src/main.cpp` — heartbeat (every 5 s) now logs
+  `swaps=N last_swap=Nms ago` alongside the existing frame counter.
+  This is the load-bearing diagnostic: if the heartbeat is alive but
+  `last_swap` keeps growing, the freeze is "compositor / applet
+  reaction to a stalled swap pipeline" and the next fix is to drive
+  an idle swap from the video thread (or from `GLContextSwitch::Swap`
+  on a watchdog). If the heartbeat itself stops appearing, the main
+  thread is wedged inside SDL/applet code.
+
+### M2 step 4 — startup JIT probe
+
+`docs/jit-memory.md` §swap-strategy step 4 says: probe `jitCreate`
+early to fail loud if the NRO does not have the JIT kernel
+capability. Landed inside `frontend/src/main.cpp` right after
+`dbg::Init()` so the log line shows up before any other dolphin
+subsystem runs:
+
+```
+M2 JIT probe: jitCreate(1 MiB) OK rw=0x… rx=0x… delta=… (rw==rx? 0)
+```
+
+Failure path is a `DBG_ERROR` explaining the likely cause (NRO
+launched outside hbmenu/hbloader) — far easier to triage than the
+`0xCAFE`-family abort the recompiler would otherwise throw at the
+first emit.
+
+This probe also doubles as the canary for step 5: it reports the
+`rx_addr - rw_addr` delta the dispatcher will need to translate
+through when the real JitArm64 backend turns on. On Horizon OS this
+will be nonzero (verified against `switchbrew/libnx:nx/source/kernel/jit.c`
+— `rw_addr` and `rx_addr` are independent virtmem reservations).
+
+### M2 step 5 — design note (not yet implemented)
+
+Mapping the rw/rx alias plumbing into `JitArm64`:
+
+- `Jit.cpp:1175` stores `b->normalEntry = GetWritableCodePtr()` — that
+  is the **rw_addr** view (the emitter writes through it).
+- `JitArm64Cache.cpp:52,60,66` use `dest->normalEntry` as the target
+  of `B` / `BL` instructions. These are PC-relative branches computed
+  as `(target - emit.GetCodePtr())` — both operands are in the rw
+  domain, so the displacement is correct as-is. No change needed.
+- `JitArm64Cache.cpp:97` uses `block.normalEntry` as the *destination
+  of writes* (the `BRK 0x123` patch when destroying a block). Must
+  remain rw_addr. No change needed.
+- `JitAsm.cpp:149` is the load-bearing site: the asm dispatcher does
+  `LDR entry, [block, #normalEntry] ; BR entry`. The dispatcher
+  itself runs from rx, so it must `BR` to an **rx_addr**. Today
+  `normalEntry` is rw — branching there from rx-mode is a Horizon OS
+  kernel panic (the rw alias is non-executable in the
+  `JitType_SetProcessMemoryPermission` backend, and even in
+  `JitType_CodeMemory` the W^X scope guard flips the rw view to
+  writable on entry, making `BR rw` a permission fault).
+
+Cleanest M2 step 5: after `LDR entry, [block, #normalEntry]`, add
+the per-instance `rw_to_rx_delta` (stored on PPCState or in a
+literal pool) before `BR entry`. The delta is constant for the
+lifetime of the `JitArm64` instance because the entire code buffer
+is one `jit_t` allocation.
+
+Two instances exist (regular + far code? Wii MMU variant?), so the
+delta must be per-instance. Plan: stash it on the dispatcher routine
+as an immediate computed at codegen time — the dispatcher is
+regenerated whenever the JIT is.
+
+Not landing this session. Required reading: `JitAsm.cpp`
+`GenerateAsm()` (full dispatcher emit), and verify how many distinct
+`jit_t` handles JitArm64 ends up creating (Common allocator currently
+keys per allocation pointer, so two handles is fine).
+
+### Build / deploy
+
+- Docker release build clean on macOS host. NRO size: 21 MiB.
+- Next: nxlink deploy via OrbStack Ubuntu VM (mac host disk at 99 %
+  full; netloader on the Switch must be re-armed manually before
+  each deploy).
+
+### Done criteria status
+
+- M3: still met (first cleared-backbuffer swap lands).
+- M2: step 4 done; steps 1–3 already in MemoryUtil last session; step
+  5 is the only remaining work before JitArm64 can be turned on. Step
+  6/7 (flip CPU core + hardware test) depends on step 5.
+
+## 2026-05-27 evening — M2 step 5: dispatcher loop confirmed; first JIT block compiled
+
+### Breakthrough
+
+JitArm64 dispatcher executes successfully on Horizon OS. 240p Suite
+GameCube ROM reaches first JIT block compile.
+
+Trace (nxlink log /tmp/nxlink-stubprobe.log):
+- `Run() #0 entering enter_code rw=0x2518ff000 rx=0xe013e5000 ... match=1`
+- `Jit(em_address=0x801ef260) #0 enter` (apploader prolog)
+- `Jit #0 compiled em_address=0x801ef260 normalEntry rw=0x251900980 rx=0xe013e6980`
+- (crash — no `Run() #0 returned`)
+
+### Findings
+
+- `EMM::IsExceptionHandlerSupported()` returns FALSE on Switch
+  (`_POSIX_VERSION` not defined in MemTools branch) → BLR optimization
+  is disabled (`m_enable_blr_optimization = false`) → ResetStack /
+  ProtectStack are no-ops. **Not** the cause of the crash.
+- libnx jit_t exec confirmed working end-to-end: stub-exec probe in
+  `frontend/src/debug_log.cpp` bakes `MOV X0,#0x42; RET` into a fresh
+  jit_t, transitions to exec, calls via rx, returns 0x42.
+- LazyMemoryRegion 64 GiB alloc fails on Switch → `m_entry_points_ptr`
+  is null → asm dispatcher takes the FastBlockMapFallback else-branch
+  at `JitAsm.cpp:152-195`. The rw→rx translation at lines 187-190 is
+  the load-bearing patch on Switch.
+- `rw_to_rx` delta is constant per JitArm64 lifetime (single jit_t
+  parent), captured once at GenerateAsm start, applied at all 3 BR
+  sites in the dispatcher.
+
+### Crash is now downstream
+
+After `BR(entry rx)` at JitAsm.cpp:190, execution enters the compiled
+ARM64 block at rx=0xe013e6980. The block does not exit cleanly (no
+`Jit #1` log; no `Run() #0 returned` log).
+
+Suspects inside the compiled block:
+- Slowmem helper calls (fastmem is off) using MOVP2R + BLR to host
+  `Memory::Read_*`/`Write_*`. Returns into rx alias — should be safe.
+- Block-internal PC-relative branches. Should work in either alias.
+- WriteExit `B(dispatcher)` — PC-relative, safe.
+- Quantized table refs — patched to translate at codegen time
+  (previous session).
+- icache coherence on rx alias after `jitTransitionToExecutable`.
+
+### Instrumentation in tree
+
+- `dolphin/Source/Core/Core/PowerPC/JitArm64/Jit.cpp` Run() (~929):
+  logs rw+rx address, reads 8 bytes from each, prints `match=` flag.
+- `dolphin/Source/Core/Core/PowerPC/JitArm64/Jit.cpp` Jit() (~1010):
+  logs em_address on entry; logs normalEntry rw/rx + near/far ranges
+  after FinalizeBlock.
+- `dolphin/Source/Core/Core/PowerPC/JitArm64/JitAsm.cpp:50`: logs
+  rw_base + rw_to_rx + dispatcher addr at GenerateAsm.
+- `frontend/src/debug_log.cpp`: stub-exec JIT capability probe.
+
+### Next probe candidates
+
+1. Dump first 16 instructions from rx alias of normalEntry (read-only
+   memory read from C++; no exec required) and disassemble offline.
+2. Pull Atmosphère crash report from
+   `sdmc:/atmosphere/crash_reports/` after the crash and inspect
+   fatal PC + general regs.
+3. Force the compiled block to emit a known `BRK #N` at start so the
+   crash address is predictable and we can confirm the fault is in
+   the block vs elsewhere.
+
+### Done criteria status
+
+- M2 step 5 partial: dispatcher runs, blocks compile. Block execution
+  is the last gap before M2 done criterion can be claimed.
