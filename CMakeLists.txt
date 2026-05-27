@@ -42,7 +42,7 @@ set(USE_SHARED_ENET      OFF CACHE BOOL "" FORCE) # use bundled enet
 # Graphics — Vulkan removed in M3 (mesa Switch ships GLES only).
 set(ENABLE_VULKAN OFF CACHE BOOL "" FORCE)        # :95
 set(ENABLE_X11    OFF CACHE BOOL "" FORCE)        # :69
-set(ENABLE_EGL    OFF CACHE BOOL "" FORCE)        # :72  (M3 wires libnx EGL via custom GLContextSwitch)
+set(ENABLE_EGL    ON  CACHE BOOL "" FORCE)        # :72  (M3 probe: GLContextEGL on devkitpro/mesa EGL)
 
 # Audio — replaced by audren in M4
 set(ENABLE_ALSA       OFF CACHE BOOL "" FORCE)    # :90

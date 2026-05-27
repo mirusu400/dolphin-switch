@@ -45,6 +45,7 @@
 #include "Common/Logging/Log.h"
 #include "Common/Logging/LogManager.h"
 #include "Common/WindowSystemInfo.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
 #include "Core/BootManager.h"
@@ -55,6 +56,15 @@
 #include "Core/System.h"
 
 #include "debug_log.h"
+
+// Exposed by Common/GL/GLInterface/Switch.cpp. Returns the total number of
+// eglSwapBuffers calls and the microsecond timestamp of the most recent
+// one (steady_clock). The frontend heartbeat uses these to detect a
+// stalled swap pipeline — the leading hypothesis for the late-boot freeze
+// (no further swap fires after OnScreenUI's initial cleared backbuffer
+// because the guest spin never produces an XFB).
+extern "C" void DolphinSwitchGetSwapStats(std::uint64_t* out_count,
+                                          std::uint64_t* out_last_us);
 
 // ----------------------------------------------------------------------------
 // Frontend->Core callback stubs (Host_* contract). M5 main UI replaces these
@@ -194,6 +204,7 @@ void EnableDolphinDiagnosticLogs()
       Common::Log::LogType::CORE,
       Common::Log::LogType::DISCIO,
       Common::Log::LogType::DSPHLE,
+      Common::Log::LogType::DYNA_REC,
       Common::Log::LogType::DVDINTERFACE,
       Common::Log::LogType::IOS,
       Common::Log::LogType::IOS_DI,
@@ -547,6 +558,37 @@ int main(int /*argc*/, char** /*argv*/)
   DBG_INFO("nxlink fd: %d (negative = no host listening)", nxlink_fd);
   LogMemorySnapshot("early boot");
 
+  // M2 startup probe: confirm the NRO actually has the JIT kernel
+  // capability before we ever try to enable JitArm64. Per
+  // docs/jit-memory.md, hbmenu/hbloader normally inherit JIT to the
+  // child NRO, but if the launcher does not we want to fail loudly
+  // here (a readable log line) rather than at the first JitArm64
+  // block emit (a 0xCAFE-family abort that takes hours to bisect).
+  {
+    constexpr std::size_t kProbeSize = 1u << 20;  // 1 MiB
+    ::Jit probe_jit{};
+    const Result rc = jitCreate(&probe_jit, kProbeSize);
+    if (R_SUCCEEDED(rc))
+    {
+      const void* rw = jitGetRwAddr(&probe_jit);
+      const void* rx = jitGetRxAddr(&probe_jit);
+      const std::intptr_t delta = reinterpret_cast<std::intptr_t>(rx) -
+                                  reinterpret_cast<std::intptr_t>(rw);
+      DBG_INFO(
+          "M2 JIT probe: jitCreate(1 MiB) OK rw=%p rx=%p delta=%lld (rw==rx? %d) "
+          "— JIT capability present, libnx jit_t available.",
+          rw, rx, static_cast<long long>(delta), rw == rx ? 1 : 0);
+      jitClose(&probe_jit);
+    }
+    else
+    {
+      DBG_ERROR("M2 JIT probe: jitCreate(1 MiB) FAILED rc=0x%08X — NRO lacks JIT "
+                "capability. Launch via hbmenu/hbloader. JitArm64 backend will "
+                "PanicAlert on first block emit.",
+                rc);
+    }
+  }
+
   bool romfs_mounted = false;
   Result romfs_rc = romfsInit();
   if (R_SUCCEEDED(romfs_rc))
@@ -652,24 +694,38 @@ int main(int /*argc*/, char** /*argv*/)
   // This is expected to surface the next blockers in the emulator core rather
   // than frontend wiring.
   //
-  // WindowSystemInfo type=Headless picks Dolphin's Null video backend,
-  // which is what we want until M3 wires GLContextSwitch into the OGL
-  // backend. Audio/input come up via the existing Switch arms (audren
-  // is M4, hid mapping is M4 — both are no-op on Switch right now).
+  // WindowSystemInfo type=Switch hands the live EGL handles owned by SDL2
+  // (which itself wraps libnx NWindow) to Dolphin's OGL backend. The backend
+  // adopts them via GLContextSwitch — no second EGL surface, no pbuffer.
   // ---------------------------------------------------------------------
+  EGLDisplay egl_display = eglGetCurrentDisplay();
+  EGLSurface egl_surface = eglGetCurrentSurface(EGL_DRAW);
+  EGLContext egl_context = eglGetCurrentContext();
+  DBG_INFO("Captured EGL handles: display=%p surface=%p context=%p",
+           (void*)egl_display, (void*)egl_surface, (void*)egl_context);
+  if (egl_display == EGL_NO_DISPLAY || egl_surface == EGL_NO_SURFACE ||
+      egl_context == EGL_NO_CONTEXT)
+  {
+    DBG_ERROR("EGL handles invalid — SDL did not create a GLES context?");
+  }
+
   WindowSystemInfo wsi{};
-  wsi.type = WindowSystemType::Headless;
-  wsi.render_window = nullptr;
-  wsi.render_surface = nullptr;
+  wsi.type = WindowSystemType::Switch;
+  wsi.display_connection = reinterpret_cast<void*>(egl_display);
+  wsi.render_surface = reinterpret_cast<void*>(egl_surface);
+  wsi.render_window = reinterpret_cast<void*>(egl_context);
 
   UICommon::InitControllers(wsi);
   DBG_INFO("UICommon::InitControllers returned.");
 
-  // Force the Null video backend — there is no working OGL backend wired to
-  // our SDL2/EGL surface yet (M3). Null lets the CPU/JIT path run without a
-  // window backend; we render our own ImGui-only output.
-  Config::SetBase(Config::MAIN_GFX_BACKEND, std::string{"Null"});
-  DBG_INFO("Forced video backend = Null.");
+  // M3: OGL backend adopts SDL's EGL display/surface/context via GLContextSwitch.
+  // The video thread will eglMakeCurrent on those handles, render to the
+  // visible NWindow surface, and eglSwapBuffers. While Core is Running the
+  // main thread MUST NOT call SDL_GL_SwapWindow or ImGui draws — see the
+  // main loop gate below.
+  Config::SetBase(Config::MAIN_GFX_BACKEND, std::string{"OGL"});
+  Config::SetBase(Config::GFX_PREFER_GLES, true);
+  DBG_INFO("Forced video backend = OGL (Switch WSI, direct NWindow render).");
 
   // Disable fastmem on Switch — Dolphin's InitFastmemArena reserves a 14
   // GiB VA window which the Switch process budget (3.2 GiB) cannot cover.
@@ -685,8 +741,16 @@ int main(int /*argc*/, char** /*argv*/)
   // kernel panic (fatal 2345-0008). The rw→rx dispatcher translation is M2
   // load-bearing work per docs/jit-memory.md §swap-strategy step 3 and is
   // not implemented yet. Interpreter sidesteps the JIT entirely.
-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::Interpreter);
-  DBG_INFO("Forced CPU core = Interpreter (JIT rw→rx alias not done; M2).");
+  // CachedInterpreter stores callback pointers in a non-executable buffer and
+  // dispatches them — no JIT pages, no executable memory, no libnx jit_t.
+  // Vastly faster than pure Interpreter so a frame actually shows up before
+  // the user gives up waiting. JIT (Arm64) is M2 work.
+  // M2 step 5: rw→rx alias translation now emitted at all three absolute BR
+  // sites in JitAsm.cpp dispatcher and at the host-side enter_code call in
+  // Jit.cpp Run()/SingleStep(). JitArm64 codegen uses jit_t writable alias
+  // for emit; execution branches via the executable alias.
+  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::JITARM64);
+  DBG_INFO("Forced CPU core = JITARM64 (M2 step 5: rw->rx dispatcher translation active).");
 
   // DSP HLE on (default true, but make it explicit). DSP_LLE drags in the
   // x86-only DSP JIT — falls back to DSPEmitterNull on ARM64 but at HLE
@@ -760,6 +824,30 @@ int main(int /*argc*/, char** /*argv*/)
     LogDolphinConfigSummary("before BootCore");
     LogMemorySnapshot("before BootCore");
 
+    // Release the EGL context from the main thread so Dolphin's video thread
+    // can eglMakeCurrent on the same display/surface/context inside
+    // GLContextSwitch::MakeCurrent. An EGL context can only be current on
+    // one thread at a time — if we hold it here, the video init aborts with
+    // EGL_BAD_ACCESS (0x3002). SDL_GL_MakeCurrent(win, nullptr) is not
+    // enough on the Switch SDL2 port, so go through EGL directly.
+    DBG_INFO("Releasing EGL context from main thread before BootCore.");
+    DBG_INFO("Pre-release state: ctx=%p surf=%p disp=%p",
+             (void*)eglGetCurrentContext(),
+             (void*)eglGetCurrentSurface(EGL_DRAW),
+             (void*)eglGetCurrentDisplay());
+    SDL_GL_MakeCurrent(window, nullptr);
+    DBG_INFO("After SDL release: ctx=%p surf=%p",
+             (void*)eglGetCurrentContext(),
+             (void*)eglGetCurrentSurface(EGL_DRAW));
+    if (eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT) != EGL_TRUE)
+    {
+      DBG_ERROR("eglMakeCurrent(EGL_NO_*) failed: 0x%04x", eglGetError());
+    }
+    DBG_INFO("After explicit release: ctx=%p surf=%p",
+             (void*)eglGetCurrentContext(),
+             (void*)eglGetCurrentSurface(EGL_DRAW));
+
     DBG_INFO("BootManager::BootCore starting...");
     const auto boot_start = std::chrono::steady_clock::now();
     core_booted = BootManager::BootCore(Core::System::GetInstance(),
@@ -786,17 +874,45 @@ int main(int /*argc*/, char** /*argv*/)
   bool running = true;
   std::uint64_t frame_counter = 0;
   auto last_heartbeat = std::chrono::steady_clock::now();
+  // M2 step 5 debug aid: when running over nxlink there is no controller
+  // input handy. Autoboot the first scanned (or fallback) ROM after a few
+  // seconds so the JIT dispatcher path is actually exercised without
+  // requiring an A press. Harmless once the browser UI lands properly.
+  const auto autoboot_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  bool autoboot_fired = false;
   while (running && appletMainLoop())
   {
     ++frame_counter;
+    if (!autoboot_fired && !core_booted &&
+        std::chrono::steady_clock::now() >= autoboot_deadline)
+    {
+      autoboot_fired = true;
+      std::string boot_path = ResolveBootPath(roms, selected, default_rom_path);
+      DBG_INFO("Autoboot timer fired — triggering ROM boot: %s",
+               boot_path.empty() ? "(none)" : boot_path.c_str());
+      try_boot_rom(boot_path);
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - last_heartbeat >= std::chrono::seconds(5))
     {
       last_heartbeat = now;
-      DBG_DEBUG("Heartbeat: frame=%llu core_booted=%d core_state=%s roms=%zu selected=%d",
-                static_cast<unsigned long long>(frame_counter), core_booted ? 1 : 0,
-                CoreStateName(Core::GetState(Core::System::GetInstance())), roms.size(),
-                selected);
+      std::uint64_t swap_count = 0;
+      std::uint64_t last_swap_us = 0;
+      DolphinSwitchGetSwapStats(&swap_count, &last_swap_us);
+      const auto now_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      const long long ms_since_swap =
+          last_swap_us == 0 ? -1
+                            : static_cast<long long>((now_us - last_swap_us) / 1000ull);
+      DBG_DEBUG(
+          "Heartbeat: frame=%llu core_booted=%d core_state=%s roms=%zu selected=%d "
+          "swaps=%llu last_swap=%lldms ago",
+          static_cast<unsigned long long>(frame_counter), core_booted ? 1 : 0,
+          CoreStateName(Core::GetState(Core::System::GetInstance())), roms.size(),
+          selected, static_cast<unsigned long long>(swap_count), ms_since_swap);
       LogMemorySnapshot("heartbeat");
     }
 
@@ -824,6 +940,16 @@ int main(int /*argc*/, char** /*argv*/)
           try_boot_rom(boot_path);
         }
       }
+    }
+
+    // While Core is running, the video thread owns the EGL context and swaps
+    // the visible NWindow surface directly. The main thread cannot touch GL
+    // or call SDL_GL_SwapWindow without stealing the context. Skip all
+    // ImGui draws + swap until the core stops.
+    if (core_booted)
+    {
+      SDL_Delay(16);
+      continue;
     }
 
     ImGui_ImplOpenGL3_NewFrame();
