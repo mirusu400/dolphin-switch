@@ -1025,3 +1025,76 @@ Suspects inside the compiled block:
 
 - M2 step 5 partial: dispatcher runs, blocks compile. Block execution
   is the last gap before M2 done criterion can be claimed.
+
+## 2026-05-27 late evening — MOVI2R PC-relative bug fixed; new blocker in Memory page table
+
+### Critical fix: MOVI2RImpl ADRP/ADR on Switch
+
+`Common/Arm64Emitter.cpp::MOVI2RImpl` optimizer picks ADRP/ADR when a
+constant happens to land within ±4 GB of the emit-time PC. Returns
+`GetCodePtr()` which is the **rw write pointer**, but code runs from
+the **rx alias** — so the encoded PC-relative offset is off by
+`rw_to_rx` at runtime.
+
+Crash signature (previous): Instruction Abort, dispatcher `BR X0` at
+JitAsm.cpp:219, PC = X0_pre (block rx, e.g. 0x2_177CE980) + X1
+(rw_to_rx held wrong value 0x4_3868_C000 instead of expected
+0x4_9C346000). Verified by hex addition matching crash PC.
+
+Fix applied: `#ifndef __SWITCH__` guard around the two `try_base`
+calls for ADRP/ADR in MOVI2RImpl (`Arm64Emitter.cpp` ~line 1900-1916).
+Switch JIT now uses MOVZ/MOVN/ORR + MOVK chains exclusively. Slightly
+larger code, but correct.
+
+### Block execution now reaches insn[59]
+
+Bumped block dump to 80 insns (`Jit.cpp` ~line 1122). Boot log
+confirms:
+- Block #0 at em_address=0x801ef260 compiles cleanly
+- `BLR X8` to FallBackToInterpreter (mtspr/mfspr handler at
+  0x7c90138a0) returns OK — pointer-load constants now correct
+- Subsequent PPC GPR stores (insn[15..50] = STR to ppcState) execute
+- Crashes at insn[59] = 0xb8204bc1 = STR W1, [X30, W0, UXTW]
+
+### New blocker: slowmem page table has null RAM entries
+
+Switch falls back to slowmem (fastmem off; LazyMemoryRegion 64 GiB
+alloc fails). `MEM_REG=X28` points to
+`memory.GetLogicalPageMappingsBase()` — a table of host pointers
+indexed by PPC page number (bits[31:17], 128 KB pages).
+
+Insn sequence at offset 0xec:
+```
+UBFM W30, W2, #17, #31      ; W30 = page = 0xAF for EA 0x815FFFE0
+LDR  X30, [X28, X30, LSL #3]; X30 = page_table[0xAF] = NULL (!)
+AND  X0, X2, #0x1FFFF       ; X0  = offset 0x1FFE0
+REV  W1, W27                ; W1  = byte-swapped store value
+STR  W1, [X30, W0, UXTW]    ; fault — addr 0
+```
+
+Crash report:
+- Type: Data Abort
+- Fault Address: 0x0
+- PC: 0x615c81a9c (block rx + 0xec)
+- X19=0x615c80000 (block rx base), X27=0x81600000 (PPC EA),
+  X28=0x8327ac298 (page table base, non-null)
+
+Dolphin's slowmem emitter sometimes lacks a CBNZ null check at the
+STR site (insn[59] has none; insn[68..72] does). Upstream assumes
+RAM pages are always populated. On Switch they are not.
+
+### Next session investigation
+
+1. Find `GetLogicalPageMappingsBase` impl + where RAM pages should
+   get registered (`Core/HW/Memmap.cpp`).
+2. Check if Switch `MemoryManager::Init` reaches the page table
+   population path or bails early due to allocator failure.
+3. Decide: fix page table population vs enable fastmem on Switch via
+   libnx VirtMem reservation.
+
+### Files modified this session
+
+- `dolphin/Source/Core/Common/Arm64Emitter.cpp` — MOVI2RImpl ADRP/ADR
+  `#ifndef __SWITCH__` guard
+- `dolphin/Source/Core/Core/PowerPC/JitArm64/Jit.cpp` — block dump
+  16 → 80 insns
